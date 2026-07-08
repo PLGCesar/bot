@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 from flask import Flask, request, render_template_string, redirect, session, url_for
 import os
 import json
