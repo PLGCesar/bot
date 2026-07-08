@@ -2,33 +2,103 @@ import discord
 from discord.ext import commands
 from flask import Flask, request, render_template_string, redirect, session, url_for
 import os
+import json
 import threading
-# Em vez de colocar o token direto, use:
-TOKEN = os.environ.get('DISCORD_TOKEN')
+import firebase_admin
+from firebase_admin import credentials, db
 
+# --- VARIÁVEIS DE AMBIENTE (Puxadas do Render ou Termux) ---
+TOKEN = os.environ.get('DISCORD_TOKEN')
+FIREBASE_URL = os.environ.get('FIREBASE_DATABASE_URL')
+FIREBASE_CREDS = os.environ.get('FIREBASE_CREDENTIALS')
 
 # --- CONFIGURAÇÃO DO BOT DO DISCORD ---
 intents = discord.Intents.default()
-# Deixado básico. Ative mais intents aqui no futuro conforme os novos comandos exigirem.
 intents.message_content = True 
 
 bot = commands.Bot(command_prefix="#", intents=intents, help_command=None)
-
 
 # --- CONFIGURAÇÃO DO SERVIDOR WEB (FLASK) ---
 app = Flask(__name__)
 SENHA_ADMIN_FILE = "senha_admin.txt"
 
 
+# --- INICIALIZAÇÃO SEGURA DO FIREBASE ---
+firebase_ativo = False
+
+if FIREBASE_URL and FIREBASE_CREDS:
+    try:
+        # Reconstrói a estrutura de credenciais a partir da variável de ambiente
+        creds_dict = json.loads(FIREBASE_CREDS)
+        cred = credentials.Certificate(creds_dict)
+        firebase_admin.initialize_app(cred, {
+            'databaseURL': FIREBASE_URL
+        })
+        firebase_ativo = True
+        print("[Firebase] Conectado com sucesso utilizando as credenciais fornecidas!")
+    except Exception as e:
+        print(f"[Erro Firebase] Falha de sintaxe ou conexão com as credenciais: {e}")
+else:
+    print("[Aviso] Firebase não detectado nas variáveis de ambiente. Usando fallback local temporário...")
+
+
+# --- FUNÇÕES DE PERSISTÊNCIA DE DADOS ---
+
+def obter_senha_admin() -> str:
+    """Busca a senha master gravada (no Firebase ou no fallback local)."""
+    if firebase_ativo:
+        try:
+            ref = db.reference("admin_config/password")
+            senha_salva = ref.get()
+            if senha_salva:
+                return senha_salva.strip()
+        except Exception as e:
+            print(f"[Erro Firebase] Falha ao ler dados da nuvem: {e}")
+
+    # Fallback local temporário (Termux / Testes locais)
+    if os.path.exists(SENHA_ADMIN_FILE):
+        try:
+            with open(SENHA_ADMIN_FILE, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return ""
+
+def salvar_senha_admin(senha: str) -> bool:
+    """Grava a senha master na nuvem (ou localmente se o Firebase estiver inativo)."""
+    sucesso = False
+    
+    if firebase_ativo:
+        try:
+            ref = db.reference("admin_config")
+            ref.set({"password": senha.strip()})
+            print("[Firebase] Nova senha administrativa persistida na nuvem com sucesso!")
+            sucesso = True
+        except Exception as e:
+            print(f"[Erro Firebase] Falha ao escrever dados na nuvem: {e}")
+
+    # Gravação em cache/fallback local por segurança
+    try:
+        with open(SENHA_ADMIN_FILE, "w", encoding="utf-8") as f:
+            f.write(senha.strip())
+        if not firebase_ativo:
+            sucesso = True
+    except Exception as e:
+        print(f"[Erro de Escrita] Não foi possível salvar o arquivo de texto local: {e}")
+        
+    return True
+
+
+# --- MÓDULO WEB (FLASK) ---
+
 @app.route("/")
 def index():
-    # Redireciona a página principal diretamente para o painel de admin
     return redirect(url_for("admin"))
 
 
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
-    # Caso 1: Primeiro acesso (A senha ainda não existe no servidor)
+    # Caso 1: Primeiro acesso (Não existe senha configurada)
     if not os.path.exists(SENHA_ADMIN_FILE):
         if request.method == "POST":
             senha_definida = request.form.get("senha")
@@ -38,7 +108,6 @@ def admin():
                 session["logado"] = True
                 return redirect(url_for("admin"))
         
-        # HTML do formulário de criação de senha (Primeiro Request de todos)
         return render_template_string("""
         <!DOCTYPE html>
         <html>
@@ -65,15 +134,11 @@ def admin():
         </html>
         """)
 
-    # Caso 2: Senha já cadastrada, mas usuário não efetuou o login na sessão
+    # Caso 2: Senha já cadastrada, mas usuário não logou nesta sessão do navegador
     if not session.get("logado"):
         if request.method == "POST":
             senha_digitada = request.form.get("senha")
-            try:
-                with open(SENHA_ADMIN_FILE, "r", encoding="utf-8") as f:
-                    senha_salva = f.read().strip()
-            except Exception:
-                senha_salva = ""
+            senha_salva = obter_senha_admin()
             
             if senha_digitada == senha_salva:
                 session["logado"] = True
@@ -86,7 +151,6 @@ def admin():
                 </div>
                 """)
         
-        # HTML da tela de Login padrão
         return render_template_string("""
         <!DOCTYPE html>
         <html>
@@ -113,7 +177,7 @@ def admin():
         </html>
         """)
 
-    # Caso 3: Login efetuado com sucesso (Painel de Controle Ativo)
+    # Caso 3: Login bem-sucedido (Visualização das métricas de conexão em tempo real)
     bot_online = bot.is_ready()
     latencia = f"{bot.latency * 1000:.0f}ms" if bot_online else "N/A"
     servidores = len(bot.guilds) if bot_online else 0
@@ -176,24 +240,30 @@ async def on_ready():
 # --- INICIALIZADOR DO FLASK ---
 
 def rodar_servidor_web():
-    """Inicializa o servidor Flask com a porta dinâmica para o Render."""
+    """Inicializa o servidor Flask associado à porta dinâmica do Render."""
     app.secret_key = "scn_bot_reimagined_master_key_123"
     porta = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=porta, debug=False, use_reloader=False)
 
 
-# --- INICIALIZAÇÃO MULTI-THREADING ---
+# --- INICIALIZAÇÃO MULTI-THREADING SECURA ---
 
 if __name__ == "__main__":
-    # Inicializa o Flask em uma Thread separada (evita travar o bot)
+    # Dispara o Flask em segundo plano para que o Render consiga detectar o bind de porta instantaneamente
     thread_web = threading.Thread(target=rodar_servidor_web, daemon=True)
     thread_web.start()
     
-    # Inicializa o bot do Discord na Thread principal
-    try:
-        # Substitua pela sua chave (TOKEN) real do Discord
-        bot.run(TOKEN)
-    except discord.errors.LoginFailure:
-        print("Erro: Token do bot inválido.")
-    except Exception as e:
-        print(f"Erro ao iniciar o bot: {e}")
+    # Validação de segurança do Token do Discord
+    if not TOKEN:
+        print("\n" + "="*60)
+        print("❌ ERRO: A variável de ambiente 'DISCORD_TOKEN' não foi encontrada!")
+        print("\n• Se estiver rodando no Termux, use: export DISCORD_TOKEN='seu_token'")
+        print("• Se estiver rodando no Render, adicione 'DISCORD_TOKEN' na aba Environment Variables.")
+        print("="*60 + "\n")
+    else:
+        try:
+            bot.run(TOKEN)
+        except discord.errors.LoginFailure:
+            print("Erro: O Token do bot fornecido na variável de ambiente é inválido.")
+        except Exception as e:
+            print(f"Erro ao iniciar o bot: {e}")
