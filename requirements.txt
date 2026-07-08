@@ -1,0 +1,4 @@
+discord
+flask
+aiohttp
+firebase-admin
