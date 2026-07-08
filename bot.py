@@ -189,7 +189,7 @@ if __name__ == "__main__":
     # Inicializa o bot do Discord na Thread principal
     try:
         # Substitua pela sua chave (TOKEN) real do Discord
-        bot.run ("MTUyNDQ2ODY1NjcyODMxMzk3MA.G13DDB.k5DmyNiuOFsHeUfQIQmllOz6602OJXYM395tz0")
+        bot.run (".")
     except discord.errors.LoginFailure:
         print("Erro: Token do bot inválido.")
     except Exception as e:
