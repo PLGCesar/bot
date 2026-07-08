@@ -35,6 +35,7 @@ firebase_ativo = False
 
 if FIREBASE_URL and FIREBASE_CREDS:
     try:
+        # Reconstrói a estrutura de credenciais a partir da variável de ambiente
         creds_dict = json.loads(FIREBASE_CREDS)
         cred = credentials.Certificate(creds_dict)
         firebase_admin.initialize_app(cred, {
@@ -113,6 +114,22 @@ def db_set(path: str, value) -> bool:
     return False
 
 
+def sincronizar_banco_local():
+    """Baixa todo o banco de dados remoto do Firebase e atualiza o arquivo local JSON no startup."""
+    if firebase_ativo:
+        try:
+            ref = db.reference("/")
+            dados = ref.get()
+            if dados is not None:
+                with open("local_db.json", "w", encoding="utf-8") as f:
+                    json.dump(dados, f, indent=4, ensure_ascii=False)
+                print("[Sincronização] Banco local_db.json atualizado com dados da nuvem!")
+            else:
+                print("[Sincronização] Banco do Firebase está vazio ou não retornou dados.")
+        except Exception as e:
+            print(f"[Erro Sincronização] Falha ao baixar dados do Firebase no boot: {e}")
+
+
 # --- FUNÇÕES DE PERSISTÊNCIA DA SENHA DO FLASK ---
 
 def obter_senha_admin() -> str:
@@ -169,7 +186,6 @@ def obter_metricas_comandos() -> tuple:
             dados = json.load(f)
             
         agora = time.time()
-        # Se passou de 1 hora desde a primeira gravação, o arquivo está expirado [2]
         if agora - dados.get("timestamp_inicial", agora) > 3600:
             try:
                 os.remove(COMANDOS_TMP_FILE)
@@ -178,7 +194,6 @@ def obter_metricas_comandos() -> tuple:
             return 0, 0.0
             
         quantidade = dados.get("quantidade", 0)
-        # Média conceito: quantidade dividida por 2
         media = quantidade / 2.0 if quantidade > 0 else 0.0
         return quantidade, media
     except Exception:
@@ -277,10 +292,7 @@ def admin():
     latencia = f"{bot.latency * 1000:.0f}ms" if bot_online else "N/A"
     servidores_count = len(bot.guilds) if bot_online else 0
     
-    # Lista de nomes de todos os servidores que o bot está conectado
     nomes_servidores = [g.name for g in bot.guilds] if bot_online else []
-    
-    # Métrica de comandos ativos na última 1h
     qtd_comandos, media_comandos = obter_metricas_comandos()
 
     return render_template_string("""
@@ -336,8 +348,8 @@ def admin():
             <h2>🖥️ Servidores Conectados Ativos</h2>
             {% if nomes_servidores %}
                 <ul class="server-list">
-                    {% for nome in nomes_servidores %}
-                        <li>{{ nome }}</li>
+                    {% for name in nomes_servidores %}
+                        <li>{{ name }}</li>
                     {% endfor %}
                 </ul>
             {% else %}
@@ -360,7 +372,6 @@ def logout():
 
 # --- COMANDOS: UTILS ---
 
-# Comando de Ping Híbrido (#ping e /ping)
 @bot.command(name="ping")
 async def ping_prefix(ctx: commands.Context):
     """Mede a latência de resposta do bot do Discord."""
@@ -382,17 +393,14 @@ async def registrar_prefix(ctx: commands.Context):
     user_id = str(ctx.author.id)
     guild_id = str(ctx.guild.id) if ctx.guild else "DirectMessage"
     
-    # Verifica duplicidade no banco
     user_data = db_get(f"users/{user_id}")
     if user_data:
         await ctx.send(f"⚠️ **Você já está registrado!** Seu ID de usuário no bot é `#{user_data['bot_id']}`.")
         return
 
-    # Processamento de novos registros
     if ctx.author.id == DONO_BOT_ID:
         bot_id = 0  # Dono do bot possui de forma estrita o ID 0
     else:
-        # Incrementa o contador na nuvem para evitar colisões
         next_id = db_get("global_config/proximo_bot_id", 1)
         bot_id = next_id
         db_set("global_config/proximo_bot_id", next_id + 1)
@@ -464,11 +472,23 @@ async def registrar_servidor_prefix(ctx: commands.Context, membro: discord.Membe
 
     guild_id = str(ctx.guild.id)
     
-    # Busca configurações de permissão do servidor no banco de dados
-    server_config = db_get(f"server_config/{guild_id}", {"permissao_registrar_servidor": True})
+    # Rótulos (Labels) customizáveis mapeados no banco (Default herda de Nome a Nome5)
+    labels_padrao = {
+        "0": "Nome",
+        "1": "Nome1",
+        "2": "Nome2",
+        "3": "Nome3",
+        "4": "Nome4",
+        "5": "Nome5"
+    }
+    server_config = db_get(f"server_config/{guild_id}", {})
+    labels = server_config.get("labels", labels_padrao)
+    for key, value in labels_padrao.items():
+        if key not in labels:
+            labels[key] = value
+
     permissao_geral = server_config.get("permissao_registrar_servidor", True)
     
-    # Controle de permissões (Dono do bot, dono do servidor ou Administradores do Discord)
     pode_executar = False
     if ctx.author.id == DONO_BOT_ID:
         pode_executar = True
@@ -483,7 +503,6 @@ async def registrar_servidor_prefix(ctx: commands.Context, membro: discord.Membe
         await ctx.send("❌ **Acesso negado!** Apenas administradores ou o dono do servidor podem registrar membros neste servidor.")
         return
 
-    # Organiza e fatiamento dos argumentos (Até 6 nomes suportados)
     nomes = nomes_raw.split() if nomes_raw else []
     while len(nomes) < 6:
         nomes.append("Não Definido")
@@ -508,24 +527,24 @@ async def registrar_servidor_prefix(ctx: commands.Context, membro: discord.Membe
         description=f"O membro {membro.mention} recebeu uma ficha de registro associada a este servidor.",
         color=discord.Color.blue()
     )
-    embed.add_field(name="Nome Principal", value=f"`{nomes[0]}`", inline=True)
-    embed.add_field(name="Nome 1", value=f"`{nomes[1]}`", inline=True)
-    embed.add_field(name="Nome 2", value=f"`{nomes[2]}`", inline=True)
-    embed.add_field(name="Nome 3", value=f"`{nomes[3]}`", inline=True)
-    embed.add_field(name="Nome 4", value=f"`{nomes[4]}`", inline=True)
-    embed.add_field(name="Nome 5", value=f"`{nomes[5]}`", inline=True)
+    embed.add_field(name=labels["0"], value=f"`{nomes[0]}`", inline=True)
+    embed.add_field(name=labels["1"], value=f"`{nomes[1]}`", inline=True)
+    embed.add_field(name=labels["2"], value=f"`{nomes[2]}`", inline=True)
+    embed.add_field(name=labels["3"], value=f"`{nomes[3]}`", inline=True)
+    embed.add_field(name=labels["4"], value=f"`{nomes[4]}`", inline=True)
+    embed.add_field(name=labels["5"], value=f"`{nomes[5]}`", inline=True)
     
     await ctx.send(embed=embed)
 
-@bot.tree.command(name="registrar-servidor", description="Cria uma ficha de registro para um membro no servidor.")
+@bot.tree.command(name="registrar-servidor", description="Cria uma ficha de registro personalizada para um membro no servidor.")
 @app_commands.describe(
     membro="Membro a ser registrado.",
-    nome="Nome principal customizado.",
-    nome1="Campo 1 customizado.",
-    nome2="Campo 2 customizado.",
-    nome3="Campo 3 customizado.",
-    nome4="Campo 4 customizado.",
-    nome5="Campo 5 customizado."
+    nome="Valor do campo 0.",
+    nome1="Valor do campo 1.",
+    nome2="Valor do campo 2.",
+    nome3="Valor do campo 3.",
+    nome4="Valor do campo 4.",
+    nome5="Valor do campo 5."
 )
 async def registrar_servidor_slash(
     interaction: discord.Interaction,
@@ -542,7 +561,21 @@ async def registrar_servidor_slash(
         return
 
     guild_id = str(interaction.guild.id)
-    server_config = db_get(f"server_config/{guild_id}", {"permissao_registrar_servidor": True})
+    
+    labels_padrao = {
+        "0": "Nome",
+        "1": "Nome1",
+        "2": "Nome2",
+        "3": "Nome3",
+        "4": "Nome4",
+        "5": "Nome5"
+    }
+    server_config = db_get(f"server_config/{guild_id}", {})
+    labels = server_config.get("labels", labels_padrao)
+    for key, value in labels_padrao.items():
+        if key not in labels:
+            labels[key] = value
+
     permissao_geral = server_config.get("permissao_registrar_servidor", True)
     
     pode_executar = False
@@ -578,26 +611,25 @@ async def registrar_servidor_slash(
         description=f"O membro {membro.mention} recebeu uma ficha de registro associada a este servidor.",
         color=discord.Color.blue()
     )
-    embed.add_field(name="Nome Principal", value=f"`{nome}`", inline=True)
-    embed.add_field(name="Nome 1", value=f"`{nome1}`", inline=True)
-    embed.add_field(name="Nome 2", value=f"`{nome2}`", inline=True)
-    embed.add_field(name="Nome 3", value=f"`{nome3}`", inline=True)
-    embed.add_field(name="Nome 4", value=f"`{nome4}`", inline=True)
-    embed.add_field(name="Nome 5", value=f"`{nome5}`", inline=True)
+    embed.add_field(name=labels["0"], value=f"`{nome}`", inline=True)
+    embed.add_field(name=labels["1"], value=f"`{nome1}`", inline=True)
+    embed.add_field(name=labels["2"], value=f"`{nome2}`", inline=True)
+    embed.add_field(name=labels["3"], value=f"`{nome3}`", inline=True)
+    embed.add_field(name=labels["4"], value=f"`{nome4}`", inline=True)
+    embed.add_field(name=labels["5"], value=f"`{nome5}`", inline=True)
     
     await interaction.response.send_message(embed=embed)
 
 
 # 3. COMANDO #registrar-config / /registrar-config
 @bot.command(name="registrar-config")
-async def registrar_config_prefix(ctx: commands.Context, valor: str = None):
+async def registrar_config_prefix(ctx: commands.Context, sub_comando: str = None, *args):
     if not ctx.guild:
         await ctx.send("❌ Este comando só pode ser utilizado dentro de um servidor.")
         return
 
     guild_id = str(ctx.guild.id)
     
-    # Verificação de permissões do editor
     permitido = False
     if ctx.author.id == DONO_BOT_ID:
         permitido = True
@@ -610,47 +642,74 @@ async def registrar_config_prefix(ctx: commands.Context, valor: str = None):
         await ctx.send("❌ **Acesso negado!** Apenas o dono do bot, dono do servidor ou administradores com privilégios podem alterar essa configuração.")
         return
 
-    if not valor:
-        await ctx.send("❌ **Parâmetro em falta!** Escreva `True` para ativar a permissão pública ou `False` para restringi-la.\nExemplo: `#registrar-config False`")
+    if not sub_comando:
+        await ctx.send("❌ **Como usar o comando:**\n"
+                       "• `#registrar-config <True/False>` - Permissão geral para o comando `#registrar-servidor`.\n"
+                       "• `#registrar-config label <0 a 5> <Novo Nome>` - Altera o nome/rótulo dos campos de registro.")
         return
 
-    # Normalização segura do input booleano
-    val_bool = None
-    if valor.lower() in ["true", "sim", "yes", "ativo", "ativado"]:
-        val_bool = True
-    elif valor.lower() in ["false", "nao", "não", "inativo", "desativado"]:
-        val_bool = False
+    # Sub-comando 1: Configuração de Permissão Geral (True ou False)
+    if sub_comando.lower() in ["true", "false", "sim", "nao", "não", "ativo", "ativado", "desativado", "inativo"]:
+        val_bool = None
+        if sub_cmd := sub_val := sub_comando.lower():
+            if sub_cmd in ["true", "sim", "ativo", "ativado"]:
+                val_bool = True
+            elif sub_cmd in ["false", "nao", "não", "inativo", "desativado"]:
+                val_bool = False
 
-    if val_bool is None:
-        await ctx.send("❌ **Valor inválido!** Especifique `True` (Permitir Todos) ou `False` (Apenas Admins).")
-        return
+        server_config = db_get(f"server_config/{guild_id}", {})
+        server_config["permissao_registrar_servidor"] = val_bool
+        db_set(f"server_config/{guild_id}", server_config)
 
-    # Altera e salva o JSON no banco de dados
-    server_config = db_get(f"server_config/{guild_id}", {})
-    server_config["permissao_registrar_servidor"] = val_bool
-    db_set(f"server_config/{guild_id}", server_config)
-
-    status_txt = "PÚBLICO (Qualquer membro pode utilizar o #registrar-servidor)" if val_bool else "RESTRITO (Apenas administradores e donos podem registrar)"
-    
-    embed = discord.Embed(
-        title="⚙️ Configurações do Servidor Atualizadas!",
-        description="A política de controle de registro de membros foi alterada.",
-        color=discord.Color.gold()
-    )
-    embed.add_field(name="Permissão Geral", value=f"`{status_txt}`", inline=False)
-    
-    if ctx.author.id == DONO_BOT_ID:
-        embed.add_field(
-            name="👑 Desenvolvedor Autorizado",
-            value="Seu ID sênior foi reconhecido. Você pode solicitar o envio da senha master do painel web utilizando `#senha-adm`.",
-            inline=False
+        status_txt = "PÚBLICO (Qualquer membro pode utilizar o #registrar-servidor)" if val_bool else "RESTRITO (Apenas administradores e donos podem registrar)"
+        
+        embed = discord.Embed(
+            title="⚙️ Configurações do Servidor Atualizadas!",
+            description="A política de controle de registro de membros foi alterada.",
+            color=discord.Color.gold()
         )
+        embed.add_field(name="Permissão Geral", value=f"`{status_txt}`", inline=False)
+        await ctx.send(embed=embed)
+        return
 
-    await ctx.send(embed=embed)
+    # Sub-comando 2: Customização de Rótulos (Labels) dos Campos
+    elif sub_comando.lower() == "label":
+        if len(args) < 2:
+            await ctx.send("❌ **Sintaxe incorreta!** Use: `#registrar-config label [0 a 5] [Novo Nome]`\n*Exemplo:* `#registrar-config label 0 Classe`")
+            return
+            
+        index_str = args[0]
+        if not index_str.isdigit() or int(index_str) < 0 or int(index_str) > 5:
+            await ctx.send("❌ O índice do campo a ser modificado deve ser um número inteiro de **0 a 5**.")
+            return
+            
+        index_campo = int(index_str)
+        novo_nome_rótulo = " ".join(args[1:])
 
-@bot.tree.command(name="registrar-config", description="Define quem pode registrar membros neste servidor.")
-@app_commands.describe(permissao="Defina como True (Qualquer um registra) ou False (Apenas administradores podem registrar).")
-async def registrar_config_slash(interaction: discord.Interaction, permissao: bool):
+        server_config = db_get(f"server_config/{guild_id}", {})
+        labels = server_config.get("labels", {})
+        labels[str(index_campo)] = novo_nome_rótulo
+        server_config["labels"] = labels
+        db_set(f"server_config/{guild_id}", server_config)
+
+        await ctx.send(f"✅ **Rótulo do Campo {index_campo} atualizado!** No registro do servidor, esse campo agora aparecerá como: **`{novo_nome_rótulo}`**.")
+        return
+
+    else:
+        await ctx.send("❌ **Sub-comando desconhecido!** Digite `#registrar-config` para ver as opções válidas.")
+
+@bot.tree.command(name="registrar-config", description="Altera as configurações de registro e customiza os campos do servidor.")
+@app_commands.describe(
+    permissao="True (Qualquer um registra) ou False (Apenas administradores).",
+    campo_index="Número do campo a ser customizado (0 a 5).",
+    campo_nome="Novo nome do rótulo de exibição para o campo selecionado."
+)
+async def registrar_config_slash(
+    interaction: discord.Interaction,
+    permissao: bool = None,
+    campo_index: int = None,
+    campo_nome: str = None
+):
     if not interaction.guild:
         await interaction.response.send_message("❌ Este comando só pode ser utilizado dentro de um servidor.", ephemeral=True)
         return
@@ -670,24 +729,33 @@ async def registrar_config_slash(interaction: discord.Interaction, permissao: bo
         return
 
     server_config = db_get(f"server_config/{guild_id}", {})
-    server_config["permissao_registrar_servidor"] = permissao
+
+    # Altera a permissão geral se fornecido o argumento
+    if permissao is not None:
+        server_config["permissao_registrar_servidor"] = permissao
+
+    # Altera a customização de rótulo se fornecido o argumento
+    if campo_index is not None and campo_nome is not None:
+        if campo_index < 0 or campo_index > 5:
+            await interaction.response.send_message("❌ O índice do campo de alteração deve estar entre 0 e 5.", ephemeral=True)
+            return
+        labels = server_config.get("labels", {})
+        labels[str(campo_index)] = campo_nome
+        server_config["labels"] = labels
+
     db_set(f"server_config/{guild_id}", server_config)
 
-    status_txt = "PÚBLICO (Qualquer membro pode utilizar o comando)" if permissao else "RESTRITO (Apenas administradores e donos podem registrar)"
+    status_txt = "Não Alterado" if permissao is None else ("PÚBLICO" if permissao else "RESTRITO")
     
     embed = discord.Embed(
         title="⚙️ Configurações do Servidor Atualizadas!",
-        description="A política de controle de registro de membros foi alterada de forma privada.",
+        description="As políticas de registro foram atualizadas.",
         color=discord.Color.gold()
     )
-    embed.add_field(name="Permissão Geral", value=f"`{status_txt}`", inline=False)
-    
-    if interaction.user.id == DONO_BOT_ID:
-        embed.add_field(
-            name="👑 Desenvolvedor Autorizado",
-            value="Seu ID sênior foi reconhecido. Você pode obter a chave master utilizando `/senha-adm`.",
-            inline=False
-        )
+    if permissao is not None:
+        embed.add_field(name="Permissão Geral", value=f"`{status_txt}`", inline=False)
+    if campo_index is not None and campo_nome is not None:
+        embed.add_field(name=f"Campo Customizado [{campo_index}]", value=f"Nome alterado para: **`{campo_nome}`**", inline=False)
 
     await interaction.response.send_message(embed=embed)
 
@@ -769,6 +837,10 @@ async def on_interaction(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     print(f"Bot do Discord conectado com sucesso como {bot.user}")
+    
+    # Executa a sincronização do banco de dados na inicialização
+    sincronizar_banco_local()
+    
     try:
         synced = await bot.tree.sync()
         print(f"Sincronizados {len(synced)} comandos de barra.")
