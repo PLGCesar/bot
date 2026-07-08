@@ -7,6 +7,8 @@ import json
 import threading
 import asyncio
 import time
+import random
+import string
 import firebase_admin
 from firebase_admin import credentials, db
 
@@ -28,6 +30,7 @@ bot = commands.Bot(command_prefix="#", intents=intents, help_command=None)
 app = Flask(__name__)
 SENHA_ADMIN_FILE = "senha_admin.txt"
 COMANDOS_TMP_FILE = "comandos_hora.tmp"
+IO_TESTE_FILE = "io_teste.tmp"
 
 
 # --- INICIALIZAÇÃO SEGURA DO FIREBASE ---
@@ -200,6 +203,57 @@ def obter_metricas_comandos() -> tuple:
         return 0, 0.0
 
 
+# --- FUNÇÕES DE TESTE DE IO ---
+
+def executar_escrita_io() -> str:
+    """Gera 500 caracteres aleatórios e grava em io_teste.tmp com validade de 60 minutos."""
+    caracteres_pool = string.ascii_letters + string.digits
+    conteudo_aleatorio = "".join(random.choices(caracteres_pool, k=500))
+    
+    dados = {
+        "timestamp": time.time(),
+        "conteudo": conteudo_aleatorio
+    }
+    
+    try:
+        with open(IO_TESTE_FILE, "w", encoding="utf-8") as f:
+            json.dump(dados, f, indent=4)
+        return conteudo_aleatorio
+    except Exception as e:
+        raise RuntimeError(f"Falha física ao escrever o arquivo no servidor: {e}")
+
+def executar_leitura_io() -> tuple:
+    """Lê o arquivo io_teste.tmp, valida a janela de 60 minutos, deleta o arquivo e retorna o resultado [2]."""
+    if not os.path.exists(IO_TESTE_FILE):
+        return False, "O arquivo temporário não existe ou já foi lido e apagado do disco.", ""
+        
+    try:
+        with open(IO_TESTE_FILE, "r", encoding="utf-8") as f:
+            dados = json.load(f)
+            
+        agora = time.time()
+        criado_em = dados.get("timestamp", 0)
+        conteudo = dados.get("conteudo", "")
+        
+        # Apaga o arquivo imediatamente para fins de segurança e limpeza
+        os.remove(IO_TESTE_FILE)
+        
+        # Validação da duração máxima de 60 minutos (3600 segundos) [2]
+        if agora - criado_em > 3600:
+            return False, f"O arquivo temporário foi encontrado, mas expirou (excedeu o limite de 60 minutos). Ele foi apagado.", ""
+            
+        return True, "Leitura realizada com sucesso!", conteudo
+        
+    except Exception as e:
+        # Tenta forçar a exclusão em caso de erro para não deixar lixo no disco
+        if os.path.exists(IO_TESTE_FILE):
+            try:
+                os.remove(IO_TESTE_FILE)
+            except Exception:
+                pass
+        return False, f"Ocorreu um erro interno durante o processamento do arquivo: {e}", ""
+
+
 # --- ROTAS DO FLASK ---
 
 @app.route("/")
@@ -370,7 +424,7 @@ def logout():
     return redirect(url_for("admin"))
 
 
-# --- COMANDOS: UTILS ---
+# --- COMANDOS: UTILS & IO TESTS ---
 
 @bot.command(name="ping")
 async def ping_prefix(ctx: commands.Context):
@@ -383,6 +437,70 @@ async def ping_slash(interaction: discord.Interaction):
     """Mede a latência em tempo real."""
     latencia = f"{bot.latency * 1000:.0f}ms"
     await interaction.response.send_message(f"🎲 **Pong!** Minha latência de API está em `{latencia}`.", ephemeral=True)
+
+
+# 1. Comando de Escrita IO (#io-w / /io-w)
+@bot.command(name="io-w")
+async def io_w_prefix(ctx: commands.Context):
+    """Gera um arquivo temporário com 500 caracteres aleatórios."""
+    try:
+        conteudo = executar_escrita_io()
+        await ctx.send(
+            f"📝 **[IO WRITER] Arquivo temporário gerado!**\n"
+            f"⏱️ **Validade:** 60 minutos\n"
+            f"📝 **Conteúdo (500 caracteres):**\n"
+            f"```\n{conteudo}\n```"
+        )
+    except Exception as e:
+        await ctx.send(f"❌ **Falha de IO:** {e}")
+
+@bot.tree.command(name="io-w", description="Gera um arquivo temporário com 500 caracteres aleatórios por 60 minutos.")
+async def io_w_slash(interaction: discord.Interaction):
+    """Gera um arquivo temporário de 500 caracteres aleatórios de forma privada."""
+    try:
+        conteudo = executar_escrita_io()
+        await interaction.response.send_message(
+            content=f"📝 **[IO WRITER] Arquivo temporário gerado!**\n"
+                    f"⏱️ **Validade:** 60 minutos\n"
+                    f"📝 **Conteúdo (500 caracteres):**\n"
+                    f"```\n{conteudo}\n```",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.response.send_message(f"❌ **Falha de IO:** {e}", ephemeral=True)
+
+
+# 2. Comando de Leitura IO (#io-r / /io-r)
+@bot.command(name="io-r")
+async def io_r_prefix(ctx: commands.Context):
+    """Lê o arquivo temporário de 500 caracteres, deleta-o e exibe o resultado."""
+    sucesso, mensagem, conteudo = executar_leitura_io()
+    
+    if sucesso:
+        await ctx.send(
+            f"📖 **[IO READER] {mensagem}**\n"
+            f"🗑️ *O arquivo físico foi destruído do disco!*\n"
+            f"📝 **Conteúdo lido:**\n"
+            f"```\n{conteudo}\n```"
+        )
+    else:
+        await ctx.send(f"❌ **[IO READER] Falha no teste:** {mensagem}")
+
+@bot.tree.command(name="io-r", description="Lê e destrói o arquivo temporário de caracteres aleatórios.")
+async def io_r_slash(interaction: discord.Interaction):
+    """Lê, exibe e destrói o arquivo temporário de forma privada."""
+    sucesso, mensagem, conteudo = executar_leitura_io()
+    
+    if sucesso:
+        await interaction.response.send_message(
+            content=f"📖 **[IO READER] {mensagem}**\n"
+                    f"🗑️ *O arquivo físico foi destruído do disco!*\n"
+                    f"📝 **Conteúdo lido:**\n"
+                    f"```\n{conteudo}\n```",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(f"❌ **[IO READER] Falha no teste:** {mensagem}", ephemeral=True)
 
 
 # --- COMANDOS: VARIANTES DO REGISTRO EM BANCO ---
@@ -650,7 +768,7 @@ async def registrar_config_prefix(ctx: commands.Context, sub_comando: str = None
                        "• `#registrar-config label <0 a 5> <Novo Nome>` - Altera o nome/rótulo dos campos de registro.")
         return
 
-    # Sub-comando 1: Configuração de Permissão Geral (True ou False) - CORRIGIDO
+    # Sub-comando 1: Configuração de Permissão Geral (True ou False)
     if sub_comando.lower() in ["true", "false", "sim", "nao", "não", "ativo", "ativado", "desativado", "inativo"]:
         val_bool = None
         sub_cmd = sub_comando.lower()
@@ -784,7 +902,6 @@ async def senha_adm_prefix(ctx: commands.Context):
         )
         await ctx.send("✅ **Senha enviada na sua DM privada de forma segura!** Verifique agora.")
         
-        # Aguarda 5 segundos antes de apagar a mensagem na DM
         await asyncio.sleep(5)
         await mensagem_dm.delete()
         
@@ -818,6 +935,65 @@ async def senha_adm_slash(interaction: discord.Interaction):
         await interaction.response.send_message(f"❌ Não consegui enviar DM. Verifique se as mensagens privadas estão abertas! Detalhes: {e}", ephemeral=True)
 
 
+# --- COMANDO DE AJUDA CUSTOMIZADO (SEM #HELP) ---
+
+def gerar_embed_ajuda() -> discord.Embed:
+    """Gera um painel com todos os comandos ativos estruturados por categoria."""
+    embed = discord.Embed(
+        title="📚 Central de Ajuda - scn_bot",
+        description="Olá! Aqui estão as instruções detalhadas e comandos que você pode usar comigo.",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(
+        name="🔑 Registro Global",
+        value="• `#registrar` ou `/registrar` - Cria o seu perfil de jogo e gera seu ID interno (Dono recebe sempre o ID `0`).",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📋 Registro de Servidor",
+        value="• `#registrar-servidor <@membro> [campo0] [campo1]...` ou `/registrar-servidor` - Registra um membro e preenche seus dados nos campos customizáveis.",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⚙️ Configurações de Ficha",
+        value="• `#registrar-config <True/False>` ou `/registrar-config` - Define se o comando de registro de servidor é público ou apenas para administradores.\n"
+              "• `#registrar-config label <0 a 5> <Novo Nome>` ou `/registrar-config` - Customiza as chaves/rótulos exibidos no comando de registro de servidor.",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⚡ Testes de IO & Latência",
+        value="• `#ping` ou `/ping` - Mede a latência da API.\n"
+              "• `#io-w` ou `/io-w` - Cria um arquivo `.tmp` de validade máxima de 60 minutos contendo 500 caracteres aleatórios.\n"
+              "• `#io-r` ou `/io-r` - Lê o arquivo de 500 caracteres, deleta-o fisicamente do disco imediatamente e exibe seu conteúdo.",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🔒 Área Administrativa",
+        value="• `#senha-adm` ou `/senha-adm` - (*Restrito ao Dono do Bot*) Solicita o envio da senha master do painel Flask na DM privada. Ela se **auto-destruirá em 5 segundos**.",
+        inline=False
+    )
+    
+    embed.set_footer(text="scn_bot - Digite #ajuda a qualquer momento para ver este painel.")
+    return embed
+
+@bot.command(name="ajuda")
+async def ajuda_prefix(ctx: commands.Context):
+    """Exibe o painel de ajuda e comandos do bot."""
+    embed = gerar_embed_ajuda()
+    await ctx.send(embed=embed)
+
+@bot.tree.command(name="ajuda", description="Exibe a lista de comandos e ajuda do bot.")
+async def ajuda_slash(interaction: discord.Interaction):
+    """Exibe o painel de ajuda do bot de forma privada."""
+    embed = gerar_embed_ajuda()
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # --- INTERCEPTORES DE EVENTO PARA MÉTRICAS (MÉDIA DE USO) ---
 
 @bot.before_invoke
@@ -830,7 +1006,6 @@ async def on_interaction(interaction: discord.Interaction):
     """Registra uma atividade de comando sempre que uma interação (/ ou botões) for ativada."""
     if interaction.type == discord.InteractionType.application_command:
         registrar_execucao_comando()
-    # Encaminha a interação para o tratamento nativo do discord.py
     await bot.process_application_commands(interaction)
 
 
@@ -840,7 +1015,7 @@ async def on_interaction(interaction: discord.Interaction):
 async def on_ready():
     print(f"Bot do Discord conectado com sucesso como {bot.user}")
     
-    # Executa a sincronização do banco de dados na inicialização
+    # Sincroniza o banco local com a nuvem na inicialização [3]
     sincronizar_banco_local()
     
     try:
