@@ -393,6 +393,7 @@ async def registrar_prefix(ctx: commands.Context):
     user_id = str(ctx.author.id)
     guild_id = str(ctx.guild.id) if ctx.guild else "DirectMessage"
     
+    # Verifica duplicidade no banco
     user_data = db_get(f"users/{user_id}")
     if user_data:
         await ctx.send(f"⚠️ **Você já está registrado!** Seu ID de usuário no bot é `#{user_data['bot_id']}`.")
@@ -401,6 +402,7 @@ async def registrar_prefix(ctx: commands.Context):
     if ctx.author.id == DONO_BOT_ID:
         bot_id = 0  # Dono do bot possui de forma estrita o ID 0
     else:
+        # Incrementa o contador na nuvem para evitar colisões
         next_id = db_get("global_config/proximo_bot_id", 1)
         bot_id = next_id
         db_set("global_config/proximo_bot_id", next_id + 1)
@@ -648,14 +650,14 @@ async def registrar_config_prefix(ctx: commands.Context, sub_comando: str = None
                        "• `#registrar-config label <0 a 5> <Novo Nome>` - Altera o nome/rótulo dos campos de registro.")
         return
 
-    # Sub-comando 1: Configuração de Permissão Geral (True ou False)
+    # Sub-comando 1: Configuração de Permissão Geral (True ou False) - CORRIGIDO
     if sub_comando.lower() in ["true", "false", "sim", "nao", "não", "ativo", "ativado", "desativado", "inativo"]:
         val_bool = None
-        if sub_cmd := sub_val := sub_comando.lower():
-            if sub_cmd in ["true", "sim", "ativo", "ativado"]:
-                val_bool = True
-            elif sub_cmd in ["false", "nao", "não", "inativo", "desativado"]:
-                val_bool = False
+        sub_cmd = sub_comando.lower()
+        if sub_cmd in ["true", "sim", "ativo", "ativado"]:
+            val_bool = True
+        elif sub_cmd in ["false", "nao", "não", "inativo", "desativado"]:
+            val_bool = False
 
         server_config = db_get(f"server_config/{guild_id}", {})
         server_config["permissao_registrar_servidor"] = val_bool
