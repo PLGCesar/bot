@@ -3,6 +3,9 @@ from discord.ext import commands
 from flask import Flask, request, render_template_string, redirect, session, url_for
 import os
 import threading
+# Em vez de colocar o token direto, use:
+TOKEN = os.environ.get('DISCORD_TOKEN')
+
 
 # --- CONFIGURAÇÃO DO BOT DO DISCORD ---
 intents = discord.Intents.default()
@@ -189,7 +192,7 @@ if __name__ == "__main__":
     # Inicializa o bot do Discord na Thread principal
     try:
         # Substitua pela sua chave (TOKEN) real do Discord
-        bot.run ("MTUyNDQ2ODY1NjcyODMxMzk3MA.Gl2KIo.ZMauRdBMvZohvGQRkHwDkfdBxOiHUvhTtwlXOI")
+        bot.run(TOKEN)
     except discord.errors.LoginFailure:
         print("Erro: Token do bot inválido.")
     except Exception as e:
