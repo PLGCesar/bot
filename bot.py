@@ -7,15 +7,12 @@ import json
 import threading
 import asyncio
 import time
-import random
-import string
-import firebase_admin
-from firebase_admin import credentials, db
+import requests
 
-# --- VARIÁVEIS DE AMBIENTE (Puxadas do Render ou Termux) ---
+# --- VARIÁVEIS DE AMBIENTE ---
 TOKEN = os.environ.get('DISCORD_TOKEN')
-FIREBASE_URL = os.environ.get('FIREBASE_DATABASE_URL')
-FIREBASE_CREDS = os.environ.get('FIREBASE_CREDENTIALS')
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
+GIST_ID = os.environ.get('GIST_ID')
 
 # ID do Dono do Bot
 DONO_BOT_ID = 1520539744457461892
@@ -24,113 +21,113 @@ DONO_BOT_ID = 1520539744457461892
 intents = discord.Intents.default()
 intents.message_content = True 
 
+# help_command=None desativa de forma estrita a ajuda padrão de texto do discord.py
 bot = commands.Bot(command_prefix="#", intents=intents, help_command=None)
 
 # --- CONFIGURAÇÃO DO SERVIDOR WEB (FLASK) ---
 app = Flask(__name__)
 SENHA_ADMIN_FILE = "senha_admin.txt"
 COMANDOS_TMP_FILE = "comandos_hora.tmp"
-IO_TESTE_FILE = "io_teste.tmp"
 
 
-# --- INICIALIZAÇÃO SEGURA DO FIREBASE ---
-firebase_ativo = False
+# --- ENGENHARIA DE BANCO DE DADOS EM NUVEM (GITHUB GIST DB) ---
 
-if FIREBASE_URL and FIREBASE_CREDS:
-    try:
-        # Reconstrói a estrutura de credenciais a partir da variável de ambiente
-        creds_dict = json.loads(FIREBASE_CREDS)
-        cred = credentials.Certificate(creds_dict)
-        firebase_admin.initialize_app(cred, {
-            'databaseURL': FIREBASE_URL
-        })
-        firebase_ativo = True
-        print("[Firebase] Conectado com sucesso utilizando as credenciais fornecidas!")
-    except Exception as e:
-        print(f"[Erro Firebase] Falha de sintaxe ou conexão com as credenciais: {e}")
-else:
-    print("[Aviso] Firebase não detectado nas variáveis de ambiente. Usando fallback local temporário...")
+# Cache local para evitar requisições desnecessárias (evita rate-limit do GitHub)
+_local_cache = {}
 
-
-# --- ENGENHARIA DE ACESSO ABSTRATO AO BANCO DE DADOS (DYNAMO HYBRID) ---
+def sincronizar_banco_local():
+    """Baixa todo o banco de dados do Gist do GitHub e sincroniza com o cache local no startup."""
+    global _local_cache
+    if GITHUB_TOKEN and GIST_ID:
+        headers = {
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
+        url = f"https://api.github.com/gists/{GIST_ID}"
+        try:
+            resp = requests.get(url, headers=headers, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                file_data = data.get("files", {}).get("database.json", {})
+                content = file_data.get("content", "{}")
+                _local_cache = json.loads(content)
+                
+                # Salva backup local
+                with open("local_db.json", "w", encoding="utf-8") as f:
+                    json.dump(_local_cache, f, indent=4, ensure_ascii=False)
+                print("[Gist DB] Banco de dados em nuvem sincronizado com sucesso!")
+                return
+            else:
+                print(f"[Gist DB] Status {resp.status_code} ao tentar carregar Gist no boot.")
+        except Exception as e:
+            print(f"[Gist DB] Falha ao conectar ao GitHub Gist: {e}")
+            
+    # Fallback local se o Gist não estiver configurado
+    if os.path.exists("local_db.json"):
+        try:
+            with open("local_db.json", "r", encoding="utf-8") as f:
+                _local_cache = json.load(f)
+            print("[Gist DB] Utilizando backup local_db.json.")
+        except Exception:
+            _local_cache = {}
 
 def db_get(path: str, default=None):
-    """Busca dados no Firebase ou foca no arquivo local JSON caso o Firebase esteja inativo."""
-    if firebase_ativo:
-        try:
-            ref = db.reference(path)
-            dados = ref.get()
-            if dados is not None:
-                return dados
-        except Exception as e:
-            print(f"[Erro Leitura Firebase] {e}")
-
-    # Fallback para JSON local (Perfeito para testar no Termux)
-    local_db_file = "local_db.json"
-    if os.path.exists(local_db_file):
-        try:
-            with open(local_db_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                keys = path.strip("/").split("/")
-                temp = data
-                for k in keys:
-                    temp = temp[k]
-                return temp
-        except Exception:
-            pass
-    return default
+    """Lê dados instantaneamente a partir do cache de memória local sincronizado (O(1))."""
+    keys = path.strip("/").split("/")
+    temp = _local_cache
+    try:
+        for k in keys:
+            temp = temp[k]
+        return temp
+    except (KeyError, TypeError):
+        return default
 
 def db_set(path: str, value) -> bool:
-    """Grava dados de forma persistente no Firebase ou no arquivo local JSON."""
-    if firebase_ativo:
-        try:
-            ref = db.reference(path)
-            ref.set(value)
-            return True
-        except Exception as e:
-            print(f"[Erro Escrita Firebase] {e}")
-            
-    # Fallback para JSON local (Termux)
-    local_db_file = "local_db.json"
-    data = {}
-    if os.path.exists(local_db_file):
-        try:
-            with open(local_db_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-            
+    """Atualiza o cache local, salva o backup em disco e envia as alterações para o GitHub Gist."""
+    global _local_cache
     keys = path.strip("/").split("/")
-    temp = data
+    temp = _local_cache
     for k in keys[:-1]:
         if k not in temp or not isinstance(temp[k], dict):
             temp[k] = {}
         temp = temp[k]
     temp[keys[-1]] = value
     
+    # Grava no backup local_db.json
     try:
-        with open(local_db_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-        return True
+        with open("local_db.json", "w", encoding="utf-8") as f:
+            json.dump(_local_cache, f, indent=4, ensure_ascii=False)
     except Exception as e:
-        print(f"[Erro Escrita Local] Falha ao salvar no local_db.json: {e}")
-    return False
-
-
-def sincronizar_banco_local():
-    """Baixa todo o banco de dados remoto do Firebase e atualiza o arquivo local JSON no startup."""
-    if firebase_ativo:
+        print(f"[Erro Escrita Local] {e}")
+        
+    # Sincroniza com a nuvem do GitHub Gist se configurado
+    if GITHUB_TOKEN and GIST_ID:
+        headers = {
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
+        url = f"https://api.github.com/gists/{GIST_ID}"
+        payload = {
+            "description": "Banco de dados do scn_bot",
+            "files": {
+                "database.json": {
+                    "content": json.dumps(_local_cache, indent=4, ensure_ascii=False)
+                }
+            }
+        }
         try:
-            ref = db.reference("/")
-            dados = ref.get()
-            if dados is not None:
-                with open("local_db.json", "w", encoding="utf-8") as f:
-                    json.dump(dados, f, indent=4, ensure_ascii=False)
-                print("[Sincronização] Banco local_db.json atualizado com dados da nuvem!")
+            resp = requests.patch(url, headers=headers, json=payload, timeout=5)
+            if resp.status_code == 200:
+                print("[Gist DB] Alterações enviadas com sucesso para a nuvem!")
+                return True
             else:
-                print("[Sincronização] Banco do Firebase está vazio ou não retornou dados.")
+                print(f"[Erro Gist DB] Status {resp.status_code} ao enviar PATCH para o GitHub.")
         except Exception as e:
-            print(f"[Erro Sincronização] Falha ao baixar dados do Firebase no boot: {e}")
+            print(f"[Erro Gist DB] Falha ao enviar modificações: {e}")
+            
+    return not (GITHUB_TOKEN and GIST_ID)  # Retorna True se rodando localmente sem Gist
 
 
 # --- FUNÇÕES DE PERSISTÊNCIA DA SENHA DO FLASK ---
@@ -201,57 +198,6 @@ def obter_metricas_comandos() -> tuple:
         return quantidade, media
     except Exception:
         return 0, 0.0
-
-
-# --- FUNÇÕES DE TESTE DE IO ---
-
-def executar_escrita_io() -> str:
-    """Gera 500 caracteres aleatórios e grava em io_teste.tmp com validade de 60 minutos."""
-    caracteres_pool = string.ascii_letters + string.digits
-    conteudo_aleatorio = "".join(random.choices(caracteres_pool, k=500))
-    
-    dados = {
-        "timestamp": time.time(),
-        "conteudo": conteudo_aleatorio
-    }
-    
-    try:
-        with open(IO_TESTE_FILE, "w", encoding="utf-8") as f:
-            json.dump(dados, f, indent=4)
-        return conteudo_aleatorio
-    except Exception as e:
-        raise RuntimeError(f"Falha física ao escrever o arquivo no servidor: {e}")
-
-def executar_leitura_io() -> tuple:
-    """Lê o arquivo io_teste.tmp, valida a janela de 60 minutos, deleta o arquivo e retorna o resultado [2]."""
-    if not os.path.exists(IO_TESTE_FILE):
-        return False, "O arquivo temporário não existe ou já foi lido e apagado do disco.", ""
-        
-    try:
-        with open(IO_TESTE_FILE, "r", encoding="utf-8") as f:
-            dados = json.load(f)
-            
-        agora = time.time()
-        criado_em = dados.get("timestamp", 0)
-        conteudo = dados.get("conteudo", "")
-        
-        # Apaga o arquivo imediatamente para fins de segurança e limpeza
-        os.remove(IO_TESTE_FILE)
-        
-        # Validação da duração máxima de 60 minutos (3600 segundos) [2]
-        if agora - criado_em > 3600:
-            return False, f"O arquivo temporário foi encontrado, mas expirou (excedeu o limite de 60 minutos). Ele foi apagado.", ""
-            
-        return True, "Leitura realizada com sucesso!", conteudo
-        
-    except Exception as e:
-        # Tenta forçar a exclusão em caso de erro para não deixar lixo no disco
-        if os.path.exists(IO_TESTE_FILE):
-            try:
-                os.remove(IO_TESTE_FILE)
-            except Exception:
-                pass
-        return False, f"Ocorreu um erro interno durante o processamento do arquivo: {e}", ""
 
 
 # --- ROTAS DO FLASK ---
@@ -424,7 +370,7 @@ def logout():
     return redirect(url_for("admin"))
 
 
-# --- COMANDOS: UTILS & IO TESTS ---
+# --- COMANDOS: UTILS ---
 
 @bot.command(name="ping")
 async def ping_prefix(ctx: commands.Context):
@@ -439,68 +385,48 @@ async def ping_slash(interaction: discord.Interaction):
     await interaction.response.send_message(f"🎲 **Pong!** Minha latência de API está em `{latencia}`.", ephemeral=True)
 
 
-# 1. Comando de Escrita IO (#io-w / /io-w)
-@bot.command(name="io-w")
-async def io_w_prefix(ctx: commands.Context):
-    """Gera um arquivo temporário com 500 caracteres aleatórios."""
-    try:
-        conteudo = executar_escrita_io()
-        await ctx.send(
-            f"📝 **[IO WRITER] Arquivo temporário gerado!**\n"
-            f"⏱️ **Validade:** 60 minutos\n"
-            f"📝 **Conteúdo (500 caracteres):**\n"
-            f"```\n{conteudo}\n```"
-        )
-    except Exception as e:
-        await ctx.send(f"❌ **Falha de IO:** {e}")
+# --- COMANDOS DE DIAGNÓSTICO E ESCRITA (I/O) NO GIST ---
 
-@bot.tree.command(name="io-w", description="Gera um arquivo temporário com 500 caracteres aleatórios por 60 minutos.")
-async def io_w_slash(interaction: discord.Interaction):
-    """Gera um arquivo temporário de 500 caracteres aleatórios de forma privada."""
-    try:
-        conteudo = executar_escrita_io()
-        await interaction.response.send_message(
-            content=f"📝 **[IO WRITER] Arquivo temporário gerado!**\n"
-                    f"⏱️ **Validade:** 60 minutos\n"
-                    f"📝 **Conteúdo (500 caracteres):**\n"
-                    f"```\n{conteudo}\n```",
-            ephemeral=True
-        )
-    except Exception as e:
-        await interaction.response.send_message(f"❌ **Falha de IO:** {e}", ephemeral=True)
+@bot.command(name="io-write")
+async def io_write_prefix(ctx: commands.Context, *, texto: str = None):
+    """Grava uma mensagem de teste no banco de dados do GitHub Gist."""
+    if not texto:
+        await ctx.send("❌ **Faltou o texto!** Escreva algo após o comando para que eu grave. Exemplo: `#io-write Teste de Conexão`")
+        return
 
-
-# 2. Comando de Leitura IO (#io-r / /io-r)
-@bot.command(name="io-r")
-async def io_r_prefix(ctx: commands.Context):
-    """Lê o arquivo temporário de 500 caracteres, deleta-o e exibe o resultado."""
-    sucesso, mensagem, conteudo = executar_leitura_io()
-    
+    sucesso = db_set("teste/mensagem", texto)
     if sucesso:
-        await ctx.send(
-            f"📖 **[IO READER] {mensagem}**\n"
-            f"🗑️ *O arquivo físico foi destruído do disco!*\n"
-            f"📝 **Conteúdo lido:**\n"
-            f"```\n{conteudo}\n```"
-        )
+        await ctx.send(f"✅ **Escrita no GitHub Gist bem-sucedida!** Gravei a informação abaixo:\n`{texto}`")
     else:
-        await ctx.send(f"❌ **[IO READER] Falha no teste:** {mensagem}")
+        await ctx.send("❌ **Falha ao salvar no banco!** Verifique as chaves e os logs do terminal.")
 
-@bot.tree.command(name="io-r", description="Lê e destrói o arquivo temporário de caracteres aleatórios.")
-async def io_r_slash(interaction: discord.Interaction):
-    """Lê, exibe e destrói o arquivo temporário de forma privada."""
-    sucesso, mensagem, conteudo = executar_leitura_io()
-    
+@bot.tree.command(name="io-write", description="Grava um texto de teste no banco de dados em nuvem.")
+@app_commands.describe(texto="O texto que deseja salvar de forma persistente.")
+async def io_write_slash(interaction: discord.Interaction, texto: str):
+    """Grava no Gist usando o comando de barra (/) com resposta efêmera."""
+    sucesso = db_set("teste/mensagem", texto)
     if sucesso:
-        await interaction.response.send_message(
-            content=f"📖 **[IO READER] {mensagem}**\n"
-                    f"🗑️ *O arquivo físico foi destruído do disco!*\n"
-                    f"📝 **Conteúdo lido:**\n"
-                    f"```\n{conteudo}\n```",
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"✅ **Escrita no Gist bem-sucedida de forma privada!** Texto salvo:\n`{texto}`", ephemeral=True)
     else:
-        await interaction.response.send_message(f"❌ **[IO READER] Falha no teste:** {mensagem}", ephemeral=True)
+        await interaction.response.send_message("❌ **Falha ao salvar no banco de dados em nuvem.**", ephemeral=True)
+
+@bot.command(name="io-read")
+async def io_read_prefix(ctx: commands.Context):
+    """Lê a mensagem de teste salva no banco de dados do GitHub Gist."""
+    texto = db_get("teste/mensagem")
+    if texto:
+        await ctx.send(f"📖 **Mensagem resgatada da nuvem com sucesso!**\n`{texto}`")
+    else:
+        await ctx.send("🔍 Nenhuma informação encontrada sob o caminho de testes. Utilize `#io-write <texto>` para cadastrar algo primeiro!")
+
+@bot.tree.command(name="io-read", description="Lê o texto de teste salvo no banco de dados em nuvem.")
+async def io_read_slash(interaction: discord.Interaction):
+    """Lê a mensagem salva no Gist usando o comando de barra (/) com resposta efêmera."""
+    texto = db_get("teste/mensagem")
+    if texto:
+        await interaction.response.send_message(f"📖 **Mensagem privada resgatada da nuvem:**\n`{texto}`", ephemeral=True)
+    else:
+        await interaction.response.send_message("🔍 Nenhuma informação de testes encontrada na nuvem.", ephemeral=True)
 
 
 # --- COMANDOS: VARIANTES DO REGISTRO EM BANCO ---
@@ -935,65 +861,6 @@ async def senha_adm_slash(interaction: discord.Interaction):
         await interaction.response.send_message(f"❌ Não consegui enviar DM. Verifique se as mensagens privadas estão abertas! Detalhes: {e}", ephemeral=True)
 
 
-# --- COMANDO DE AJUDA CUSTOMIZADO (SEM #HELP) ---
-
-def gerar_embed_ajuda() -> discord.Embed:
-    """Gera um painel com todos os comandos ativos estruturados por categoria."""
-    embed = discord.Embed(
-        title="📚 Central de Ajuda - scn_bot",
-        description="Olá! Aqui estão as instruções detalhadas e comandos que você pode usar comigo.",
-        color=discord.Color.blue()
-    )
-    
-    embed.add_field(
-        name="🔑 Registro Global",
-        value="• `#registrar` ou `/registrar` - Cria o seu perfil de jogo e gera seu ID interno (Dono recebe sempre o ID `0`).",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="📋 Registro de Servidor",
-        value="• `#registrar-servidor <@membro> [campo0] [campo1]...` ou `/registrar-servidor` - Registra um membro e preenche seus dados nos campos customizáveis.",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="⚙️ Configurações de Ficha",
-        value="• `#registrar-config <True/False>` ou `/registrar-config` - Define se o comando de registro de servidor é público ou apenas para administradores.\n"
-              "• `#registrar-config label <0 a 5> <Novo Nome>` ou `/registrar-config` - Customiza as chaves/rótulos exibidos no comando de registro de servidor.",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="⚡ Testes de IO & Latência",
-        value="• `#ping` ou `/ping` - Mede a latência da API.\n"
-              "• `#io-w` ou `/io-w` - Cria um arquivo `.tmp` de validade máxima de 60 minutos contendo 500 caracteres aleatórios.\n"
-              "• `#io-r` ou `/io-r` - Lê o arquivo de 500 caracteres, deleta-o fisicamente do disco imediatamente e exibe seu conteúdo.",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="🔒 Área Administrativa",
-        value="• `#senha-adm` ou `/senha-adm` - (*Restrito ao Dono do Bot*) Solicita o envio da senha master do painel Flask na DM privada. Ela se **auto-destruirá em 5 segundos**.",
-        inline=False
-    )
-    
-    embed.set_footer(text="scn_bot - Digite #ajuda a qualquer momento para ver este painel.")
-    return embed
-
-@bot.command(name="ajuda")
-async def ajuda_prefix(ctx: commands.Context):
-    """Exibe o painel de ajuda e comandos do bot."""
-    embed = gerar_embed_ajuda()
-    await ctx.send(embed=embed)
-
-@bot.tree.command(name="ajuda", description="Exibe a lista de comandos e ajuda do bot.")
-async def ajuda_slash(interaction: discord.Interaction):
-    """Exibe o painel de ajuda do bot de forma privada."""
-    embed = gerar_embed_ajuda()
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
 # --- INTERCEPTORES DE EVENTO PARA MÉTRICAS (MÉDIA DE USO) ---
 
 @bot.before_invoke
@@ -1009,13 +876,78 @@ async def on_interaction(interaction: discord.Interaction):
     await bot.process_application_commands(interaction)
 
 
+# --- COMANDOS: CENTRAL DE AJUDA (HELP / AJUDA) ---
+
+def criar_embed_ajuda() -> discord.Embed:
+    """Gera o Embed centralizado e organizado de ajuda para os usuários."""
+    embed = discord.Embed(
+        title="📚 Central de Ajuda - scn_bot",
+        description="Aqui estão as instruções de uso e comandos disponíveis nesta nova versão do bot:",
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="🔑 Registro Global",
+        value="`#registrar` ou `/registrar`\n"
+              "• Cadastra o seu usuário no bot. O desenvolvedor sênior do bot recebe de forma exclusiva o ID `#0`.",
+        inline=False
+    )
+    embed.add_field(
+        name="📋 Ficha de Servidores",
+        value="`#registrar-servidor [@membro] [valores...]` ou `/registrar-servidor`\n"
+              "• Registra uma ficha contendo 6 parâmetros customizáveis para um membro do servidor.",
+        inline=False
+    )
+    embed.add_field(
+        name="⚙️ Configurações Administrativas",
+        value="`#registrar-config` ou `/registrar-config`\n"
+              "• Permite ligar/desligar a permissão pública de registro ou customizar os nomes dos campos (slots de 0 a 5) de exibição.",
+        inline=False
+    )
+    embed.add_field(
+        name="🔌 Testes de Conexão (GitHub Gist DB)",
+        value="`#io-write <texto>` / `/io-write <texto>`\n"
+              "• Grava uma mensagem de teste em tempo real na nuvem.\n"
+              "`#io-read` / `/io-read`\n"
+              "• Lê a última mensagem de teste salva diretamente do Gist do GitHub.",
+        inline=False
+    )
+    embed.add_field(
+        name="⚡ Utilitários Rápidos",
+        value="`#ping` ou `/ping`\n"
+              "• Mostra o tempo de latência de comunicação com a API do Discord em milissegundos.\n"
+              "`#senha-adm` ou `/senha-adm`\n"
+              "• Protocolo exclusivo de segurança do criador: Envia a senha master na DM e se auto-destrói em 5 segundos.",
+        inline=False
+    )
+    embed.set_footer(text="scn_bot - Nova Geração de Bots")
+    return embed
+
+@bot.command(name="help", aliases=["ajuda"])
+async def help_prefix(ctx: commands.Context):
+    """Menu de ajuda em prefixo (#help ou #ajuda)."""
+    embed = criar_embed_ajuda()
+    await ctx.send(embed=embed)
+
+@bot.tree.command(name="help", description="Mostra o menu explicativo de ajuda com todos os comandos.")
+async def help_slash(interaction: discord.Interaction):
+    """Menu de ajuda em barra (/help)."""
+    embed = criar_embed_ajuda()
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="ajuda", description="Mostra o menu explicativo de ajuda com todos os comandos.")
+async def ajuda_slash(interaction: discord.Interaction):
+    """Menu de ajuda em barra alternativo (/ajuda)."""
+    embed = criar_embed_ajuda()
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # --- EVENTOS BÁSICOS DO DISCORD ---
 
 @bot.event
 async def on_ready():
     print(f"Bot do Discord conectado com sucesso como {bot.user}")
     
-    # Sincroniza o banco local com a nuvem na inicialização [3]
+    # Sincroniza o banco de dados do GitHub Gist com a memória RAM e backup local
     sincronizar_banco_local()
     
     try:
