@@ -9,7 +9,7 @@ import asyncio
 import time
 import requests
 
-# --- VARIÁVEIS DE AMBIENTE ---
+# --- VARIÁVEIS DE AMBIENTE (Puxadas do Render ou Termux) ---
 TOKEN = os.environ.get('DISCORD_TOKEN')
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
 GIST_ID = os.environ.get('GIST_ID')
@@ -292,7 +292,10 @@ def admin():
     latencia = f"{bot.latency * 1000:.0f}ms" if bot_online else "N/A"
     servidores_count = len(bot.guilds) if bot_online else 0
     
+    # Lista de nomes de todos os servidores que o bot está conectado
     nomes_servidores = [g.name for g in bot.guilds] if bot_online else []
+    
+    # Métrica de comandos ativos na última 1h
     qtd_comandos, media_comandos = obter_metricas_comandos()
 
     return render_template_string("""
@@ -383,50 +386,6 @@ async def ping_slash(interaction: discord.Interaction):
     """Mede a latência em tempo real."""
     latencia = f"{bot.latency * 1000:.0f}ms"
     await interaction.response.send_message(f"🎲 **Pong!** Minha latência de API está em `{latencia}`.", ephemeral=True)
-
-
-# --- COMANDOS DE DIAGNÓSTICO E ESCRITA (I/O) NO GIST ---
-
-@bot.command(name="io-write")
-async def io_write_prefix(ctx: commands.Context, *, texto: str = None):
-    """Grava uma mensagem de teste no banco de dados do GitHub Gist."""
-    if not texto:
-        await ctx.send("❌ **Faltou o texto!** Escreva algo após o comando para que eu grave. Exemplo: `#io-write Teste de Conexão`")
-        return
-
-    sucesso = db_set("teste/mensagem", texto)
-    if sucesso:
-        await ctx.send(f"✅ **Escrita no GitHub Gist bem-sucedida!** Gravei a informação abaixo:\n`{texto}`")
-    else:
-        await ctx.send("❌ **Falha ao salvar no banco!** Verifique as chaves e os logs do terminal.")
-
-@bot.tree.command(name="io-write", description="Grava um texto de teste no banco de dados em nuvem.")
-@app_commands.describe(texto="O texto que deseja salvar de forma persistente.")
-async def io_write_slash(interaction: discord.Interaction, texto: str):
-    """Grava no Gist usando o comando de barra (/) com resposta efêmera."""
-    sucesso = db_set("teste/mensagem", texto)
-    if sucesso:
-        await interaction.response.send_message(f"✅ **Escrita no Gist bem-sucedida de forma privada!** Texto salvo:\n`{texto}`", ephemeral=True)
-    else:
-        await interaction.response.send_message("❌ **Falha ao salvar no banco de dados em nuvem.**", ephemeral=True)
-
-@bot.command(name="io-read")
-async def io_read_prefix(ctx: commands.Context):
-    """Lê a mensagem de teste salva no banco de dados do GitHub Gist."""
-    texto = db_get("teste/mensagem")
-    if texto:
-        await ctx.send(f"📖 **Mensagem resgatada da nuvem com sucesso!**\n`{texto}`")
-    else:
-        await ctx.send("🔍 Nenhuma informação encontrada sob o caminho de testes. Utilize `#io-write <texto>` para cadastrar algo primeiro!")
-
-@bot.tree.command(name="io-read", description="Lê o texto de teste salvo no banco de dados em nuvem.")
-async def io_read_slash(interaction: discord.Interaction):
-    """Lê a mensagem salva no Gist usando o comando de barra (/) com resposta efêmera."""
-    texto = db_get("teste/mensagem")
-    if texto:
-        await interaction.response.send_message(f"📖 **Mensagem privada resgatada da nuvem:**\n`{texto}`", ephemeral=True)
-    else:
-        await interaction.response.send_message("🔍 Nenhuma informação de testes encontrada na nuvem.", ephemeral=True)
 
 
 # --- COMANDOS: VARIANTES DO REGISTRO EM BANCO ---
@@ -873,7 +832,6 @@ async def on_interaction(interaction: discord.Interaction):
     """Registra uma atividade de comando sempre que uma interação (/ ou botões) for ativada."""
     if interaction.type == discord.InteractionType.application_command:
         registrar_execucao_comando()
-    await bot.process_application_commands(interaction)
 
 
 # --- COMANDOS: CENTRAL DE AJUDA (HELP / AJUDA) ---
