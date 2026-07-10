@@ -8,6 +8,8 @@ import threading
 import asyncio
 import time
 import requests
+import io
+from PIL import Image, ImageDraw, ImageFont
 
 # --- VARIÁVEIS DE AMBIENTE (Puxadas do Render ou Termux) ---
 TOKEN = os.environ.get('DISCORD_TOKEN')
@@ -130,6 +132,44 @@ def db_set(path: str, value) -> bool:
     return not (GITHUB_TOKEN and GIST_ID)  # Retorna True se rodando localmente sem Gist
 
 
+# --- MÓDULO DE BANCO DE DADOS DE USUÁRIOS (REGISTRO DINÂMICO) ---
+
+def obter_registro(discord_id: int) -> dict:
+    """Busca as informações de um usuário com base no ID do Discord."""
+    return db_get(f"users/{discord_id}")
+
+def obter_ou_auto_registrar(user: discord.User, guild_id: str = "DirectMessage") -> dict:
+    """Retorna os dados do usuário. Se ele não for cadastrado, registra-o automaticamente de forma invisível."""
+    user_id = str(user.id)
+    user_data = db_get(f"users/{user_id}")
+    if user_data:
+        return user_data
+        
+    # Registro automático dinâmico no primeiro comando ativado
+    if user.id == DONO_BOT_ID:
+        bot_id = 0
+    else:
+        next_id = db_get("global_config/proximo_bot_id", 1)
+        bot_id = next_id
+        db_set("global_config/proximo_bot_id", next_id + 1)
+        
+    novo_cadastro = {
+        "discord_id": user_id,
+        "guild_id": guild_id,
+        "bot_id": bot_id,
+        "nome": user.display_name,
+        "perfil": {
+            "fundo": "#2f3136",
+            "fundo_url": "",
+            "avatar_pos": "superior_esquerdo",
+            "descricao": "Nenhuma descrição definida ainda. Use #perfil-config para personalizar!"
+        }
+    }
+    db_set(f"users/{user_id}", novo_cadastro)
+    print(f"[Auto-Registro] Usuário {user.name} cadastrado com ID interno #{bot_id}!")
+    return novo_cadastro
+
+
 # --- FUNÇÕES DE PERSISTÊNCIA DA SENHA DO FLASK ---
 
 def obter_senha_admin() -> str:
@@ -148,6 +188,96 @@ def salvar_senha_admin(senha: str) -> bool:
 def existe_senha_admin() -> bool:
     """Verifica se já existe uma senha configurada no banco."""
     return len(obter_senha_admin()) > 0
+
+
+# --- MÓDULO DE RENDEREZAÇÃO DO CARTÃO DE PERFIL (PILLOW) ---
+
+def gerar_imagem_perfil(nome: str, bot_id: int, avatar_url: str, pos: str, descricao: str, fundo_cor: str, fundo_url: str = None) -> io.BytesIO:
+    """Desenha dinamicamente o cartão de perfil em 600x300px com avatares redondos posicionáveis."""
+    W, H = 600, 300
+    
+    # 1. Carrega plano de fundo
+    if fundo_url:
+        try:
+            resp = requests.get(fundo_url, timeout=3)
+            img_fundo = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+            img_fundo = img_fundo.resize((W, H))
+        except Exception:
+            img_fundo = Image.new("RGBA", (W, H), fundo_cor)
+    else:
+        try:
+            img_fundo = Image.new("RGBA", (W, H), fundo_cor)
+        except Exception:
+            img_fundo = Image.new("RGBA", (W, H), "#2f3136")
+            
+    draw = ImageDraw.Draw(img_fundo)
+    
+    # 2. Caixa semi-transparente para dar contraste ao texto de biografia
+    draw.rectangle([20, 200, 580, 280], fill=(0, 0, 0, 110))
+    
+    # 3. Carrega e posiciona o avatar redondo do Discord
+    avatar_size = 120
+    try:
+        resp_av = requests.get(avatar_url, timeout=3)
+        img_avatar = Image.open(io.BytesIO(resp_av.content)).convert("RGBA")
+        img_avatar = img_avatar.resize((avatar_size, avatar_size))
+        
+        # Cria máscara circular perfeita para o avatar
+        mascara = Image.new("L", (avatar_size, avatar_size), 0)
+        draw_mascara = ImageDraw.Draw(mascara)
+        draw_mascara.ellipse((0, 0, avatar_size, avatar_size), fill=255)
+        
+        # Coordenadas do canto com margem (padding)
+        pad = 20
+        if pos in ["superior_esquerdo", "se"]:
+            coords = (pad, pad)
+        elif pos in ["superior_direito", "sd"]:
+            coords = (W - avatar_size - pad, pad)
+        elif pos in ["inferior_esquerdo", "ie"]:
+            coords = (pad, H - avatar_size - pad)
+        elif pos in ["inferior_direito", "id"]:
+            coords = (W - avatar_size - pad, H - avatar_size - pad)
+        else:
+            coords = (pad, pad)
+            
+        img_fundo.paste(img_avatar, coords, mascara)
+    except Exception as e:
+        print(f"[Pillow] Falha ao renderizar avatar redondo: {e}")
+        
+    # 4. Escrita de Textos com Fontes do Sistema (Fallback de segurança)
+    fonte = None
+    try:
+        font_paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "arial.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf"
+        ]
+        for path in font_paths:
+            if os.path.exists(path):
+                fonte = ImageFont.truetype(path, 18)
+                break
+    except Exception:
+        pass
+        
+    # Posiciona o texto de acordo com o lado livre do avatar
+    text_x = 160 if pos in ["superior_esquerdo", "inferior_esquerdo", "se", "ie"] else 40
+    text_y = 40 if pos in ["superior_esquerdo", "superior_direito", "se", "sd"] else 120
+    
+    draw.text((text_x, text_y), f"Nome: {nome}", fill="white", font=fonte)
+    draw.text((text_x, text_y + 30), f"ID no Bot: #{bot_id}", fill="#5865F2", font=fonte)
+    
+    # 5. Escrita inteligente de descrição com auto-quebra de linha
+    desc_linhas = [descricao[i:i+55] for i in range(0, len(descricao), 55)]
+    curr_y = 210
+    for linha in desc_linhas[:3]:  # Limite de 3 linhas de biografia
+        draw.text((30, curr_y), linha, fill="#e3e5e8", font=fonte)
+        curr_y += 22
+        
+    # Salva imagem diretamente no buffer de memória RAM
+    buffer = io.BytesIO()
+    img_fundo.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
 
 
 # --- MÓDULO DE MÉTRICAS E TRAQUEAMENTO DE COMANDOS ---
@@ -408,7 +538,7 @@ async def io_write_prefix(ctx: commands.Context, *, texto: str = None):
 async def io_write_slash(interaction: discord.Interaction, texto: str):
     """Grava no Gist usando o comando de barra (/) com resposta efêmera."""
     sucesso = db_set("teste/mensagem", texto)
-    if onSuccess := sucesso:
+    if sucesso:
         await interaction.response.send_message(f"✅ **Escrita no Gist bem-sucedida de forma privada!** Texto salvo:\n`{texto}`", ephemeral=True)
     else:
         await interaction.response.send_message("❌ **Falha ao salvar no banco de dados em nuvem.**", ephemeral=True)
@@ -440,72 +570,17 @@ async def registrar_prefix(ctx: commands.Context):
     user_id = str(ctx.author.id)
     guild_id = str(ctx.guild.id) if ctx.guild else "DirectMessage"
     
-    # Verifica duplicidade no banco
-    user_data = db_get(f"users/{user_id}")
-    if user_data:
-        await ctx.send(f"⚠️ **Você já está registrado!** Seu ID de usuário no bot é `#{user_data['bot_id']}`.")
-        return
-
-    if ctx.author.id == DONO_BOT_ID:
-        bot_id = 0  # Dono do bot possui de forma estrita o ID 0
-    else:
-        # Incrementa o contador na nuvem para evitar colisões
-        next_id = db_get("global_config/proximo_bot_id", 1)
-        bot_id = next_id
-        db_set("global_config/proximo_bot_id", next_id + 1)
-        
-    novo_cadastro = {
-        "discord_id": user_id,
-        "guild_id": guild_id,
-        "bot_id": bot_id
-    }
-    db_set(f"users/{user_id}", novo_cadastro)
-    
-    embed = discord.Embed(
-        title="🎉 Registro Concluído com Sucesso!",
-        description=f"Seja bem-vindo, {ctx.author.mention}!",
-        color=discord.Color.green()
-    )
-    embed.add_field(name="ID no Bot", value=f"`#{bot_id}`", inline=True)
-    embed.add_field(name="ID do Discord", value=f"`{user_id}`", inline=True)
-    if ctx.guild:
-        embed.add_field(name="Servidor Principal", value=f"`{ctx.guild.name}`", inline=False)
-        
-    await ctx.send(embed=embed)
+    # Auto-registrador cuida do processo
+    user_data = obter_ou_auto_registrar(ctx.author, guild_id)
+    await ctx.send(f"🎉 **Registro Concluído!** ID do Bot: `#{user_data['bot_id']}` | ID do Discord: `{user_id}`")
 
 @bot.tree.command(name="registrar", description="Registra seu usuário globalmente no banco de dados do bot.")
 async def registrar_slash(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     guild_id = str(interaction.guild.id) if interaction.guild else "DirectMessage"
     
-    user_data = db_get(f"users/{user_id}")
-    if user_data:
-        await interaction.response.send_message(f"⚠️ **Você já está registrado!** Seu ID de usuário no bot é `#{user_data['bot_id']}`.", ephemeral=True)
-        return
-
-    if interaction.user.id == DONO_BOT_ID:
-        bot_id = 0
-    else:
-        next_id = db_get("global_config/proximo_bot_id", 1)
-        bot_id = next_id
-        db_set("global_config/proximo_bot_id", next_id + 1)
-        
-    novo_cadastro = {
-        "discord_id": user_id,
-        "guild_id": guild_id,
-        "bot_id": bot_id
-    }
-    db_set(f"users/{user_id}", novo_cadastro)
-    
-    embed = discord.Embed(
-        title="🎉 Registro Concluído com Sucesso!",
-        description=f"Seja bem-vindo, {interaction.user.mention}!",
-        color=discord.Color.green()
-    )
-    embed.add_field(name="ID no Bot", value=f"`#{bot_id}`", inline=True)
-    embed.add_field(name="ID do Discord", value=f"`{user_id}`", inline=True)
-    
-    await interaction.response.send_message(embed=embed)
+    user_data = obter_ou_auto_registrar(interaction.user, guild_id)
+    await interaction.response.send_message(f"🎉 **Registro Concluído!** ID do Bot: `#{user_data['bot_id']}` | ID do Discord: `{user_id}`")
 
 
 # 2. COMANDO #registrar-servidor / /registrar-servidor
@@ -521,6 +596,16 @@ async def registrar_servidor_prefix(ctx: commands.Context, membro: discord.Membe
 
     guild_id = str(ctx.guild.id)
     
+    # Auto-registra o executor do comando
+    autor_data = obter_ou_auto_registrar(ctx.author, guild_id)
+    bot_id_owner = autor_data["bot_id"]
+    
+    # Sorteador de ID sequencial e persistente de cada ficha salvamento por Servidor
+    server_config = db_get(f"server_config/{guild_id}", {})
+    proximo_reg_id = server_config.get("proximo_registro_id", 1)
+    server_config["proximo_registro_id"] = proximo_reg_id + 1
+    db_set(f"server_config/{guild_id}", server_config)
+
     # Rótulos (Labels) customizáveis mapeados no banco (Default herda de Nome a Nome5)
     labels_padrao = {
         "0": "Nome",
@@ -530,7 +615,6 @@ async def registrar_servidor_prefix(ctx: commands.Context, membro: discord.Membe
         "4": "Nome4",
         "5": "Nome5"
     }
-    server_config = db_get(f"server_config/{guild_id}", {})
     labels = server_config.get("labels", labels_padrao)
     for key, value in labels_padrao.items():
         if key not in labels:
@@ -558,6 +642,8 @@ async def registrar_servidor_prefix(ctx: commands.Context, membro: discord.Membe
     nomes = nomes[:6]
 
     registro_membro = {
+        "id": proximo_reg_id,
+        "owner": bot_id_owner,  # Salva o id interno no bot de quem registrou
         "server_id": guild_id,
         "owner_id": ctx.guild.owner_id,
         "registered_user_id": str(membro.id),
@@ -572,8 +658,8 @@ async def registrar_servidor_prefix(ctx: commands.Context, membro: discord.Membe
     db_set(f"server_registrations/{guild_id}/{membro.id}", registro_membro)
     
     embed = discord.Embed(
-        title="📋 Ficha de Servidor Registrada!",
-        description=f"O membro {membro.mention} recebeu uma ficha de registro associada a este servidor.",
+        title=f"📋 Ficha de Servidor Registrada (ID: #{proximo_reg_id})!",
+        description=f"O membro {membro.mention} recebeu uma ficha de registro. Criada pelo ID do Bot `#{bot_id_owner}`.",
         color=discord.Color.blue()
     )
     embed.add_field(name=labels["0"], value=f"`{nomes[0]}`", inline=True)
@@ -611,6 +697,14 @@ async def registrar_servidor_slash(
 
     guild_id = str(interaction.guild.id)
     
+    autor_data = obter_ou_auto_registrar(interaction.user, guild_id)
+    bot_id_owner = autor_data["bot_id"]
+    
+    server_config = db_get(f"server_config/{guild_id}", {})
+    proximo_reg_id = server_config.get("proximo_registro_id", 1)
+    server_config["proximo_registro_id"] = proximo_reg_id + 1
+    db_set(f"server_config/{guild_id}", server_config)
+
     labels_padrao = {
         "0": "Nome",
         "1": "Nome1",
@@ -619,7 +713,6 @@ async def registrar_servidor_slash(
         "4": "Nome4",
         "5": "Nome5"
     }
-    server_config = db_get(f"server_config/{guild_id}", {})
     labels = server_config.get("labels", labels_padrao)
     for key, value in labels_padrao.items():
         if key not in labels:
@@ -642,6 +735,8 @@ async def registrar_servidor_slash(
         return
 
     registro_membro = {
+        "id": proximo_reg_id,
+        "owner": bot_id_owner,
         "server_id": guild_id,
         "owner_id": interaction.guild.owner_id,
         "registered_user_id": str(membro.id),
@@ -656,8 +751,8 @@ async def registrar_servidor_slash(
     db_set(f"server_registrations/{guild_id}/{membro.id}", registro_membro)
     
     embed = discord.Embed(
-        title="📋 Ficha de Servidor Registrada!",
-        description=f"O membro {membro.mention} recebeu uma ficha de registro associada a este servidor.",
+        title=f"📋 Ficha de Servidor Registrada (ID: #{proximo_reg_id})!",
+        description=f"O membro {membro.mention} recebeu uma ficha de registro. Criada pelo ID do Bot `#{bot_id_owner}`.",
         color=discord.Color.blue()
     )
     embed.add_field(name=labels["0"], value=f"`{nome}`", inline=True)
@@ -809,6 +904,182 @@ async def registrar_config_slash(
     await interaction.response.send_message(embed=embed)
 
 
+# --- COMANDOS: PERSONALIZAÇÃO DE PERFIL ---
+
+# 1. COMANDO #perfil / /perfil
+@bot.command(name="perfil")
+async def perfil_prefix(ctx: commands.Context):
+    """Gera e exibe a imagem personalizada do perfil do usuário."""
+    # Garante o auto-registro no primeiro comando usado
+    user_data = obter_ou_auto_registrar(ctx.author, str(ctx.guild.id) if ctx.guild else "DirectMessage")
+    
+    bot_id = user_data["bot_id"]
+    nome = user_data["nome"]
+    perfil = user_data.get("perfil", {})
+    
+    fundo_cor = perfil.get("fundo", "#2f3136")
+    fundo_url = perfil.get("fundo_url", "")
+    pos = perfil.get("avatar_pos", "superior_esquerdo")
+    descricao = perfil.get("descricao", "Nenhuma biografia definida.")
+    
+    avatar_url = ctx.author.display_avatar.url
+
+    # Exibe animação de digitação
+    async with ctx.typing():
+        try:
+            loop = asyncio.get_running_loop()
+            # Roda o gerador do Pillow em um Executor em segundo plano para não travar o loop de eventos
+            buffer = await loop.run_in_executor(
+                None, gerar_imagem_perfil, nome, bot_id, avatar_url, pos, descricao, fundo_cor, fundo_url
+            )
+            file = discord.File(fp=buffer, filename="perfil.png")
+            await ctx.send(file=file)
+        except Exception as e:
+            # Fallback de segurança em modo Embed Rich
+            embed = discord.Embed(
+                title=f"👤 Perfil de {nome} (Slot #{bot_id})",
+                description=descricao,
+                color=discord.Color.blue()
+            )
+            embed.add_field(name="Posição do Avatar", value=f"`{pos}`", inline=True)
+            embed.add_field(name="Cor do Fundo", value=f"`{fundo_cor}`", inline=True)
+            await ctx.send(content=f"⚠️ Falha de renderização local ({e}). Exibindo formato alternativo:", embed=embed)
+
+@bot.tree.command(name="perfil", description="Exibe o seu cartão de perfil personalizado em formato de imagem.")
+async def perfil_slash(interaction: discord.Interaction):
+    """Versão de comando de barra (/perfil) privada."""
+    await interaction.response.defer(ephemeral=True)
+    
+    guild_id = str(interaction.guild.id) if interaction.guild else "DirectMessage"
+    user_data = obter_ou_auto_registrar(interaction.user, guild_id)
+    
+    bot_id = user_data["bot_id"]
+    nome = user_data["nome"]
+    perfil = user_data.get("perfil", {})
+    
+    fundo_cor = perfil.get("fundo", "#2f3136")
+    fundo_url = perfil.get("fundo_url", "")
+    pos = perfil.get("avatar_pos", "superior_esquerdo")
+    descricao = perfil.get("descricao", "Nenhuma biografia definida.")
+    
+    avatar_url = interaction.user.display_avatar.url
+
+    try:
+        loop = asyncio.get_running_loop()
+        buffer = await loop.run_in_executor(
+            None, gerar_imagem_perfil, nome, bot_id, avatar_url, pos, descricao, fundo_cor, fundo_url
+        )
+        file = discord.File(fp=buffer, filename="perfil.png")
+        await interaction.followup.send(file=file, ephemeral=True)
+    except Exception as e:
+        embed = discord.Embed(
+            title=f"👤 Perfil de {nome} (Slot #{bot_id})",
+            description=descricao,
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Posição do Avatar", value=f"`{pos}`", inline=True)
+        embed.add_field(name="Cor do Fundo", value=f"`{fundo_cor}`", inline=True)
+        await interaction.followup.send(content=f"⚠️ Falha de renderização local ({e}). Exibindo formato alternativo:", embed=embed, ephemeral=True)
+
+
+# 2. COMANDO #perfil-config / /perfil-config
+@bot.command(name="perfil-config")
+async def perfil_config_prefix(ctx: commands.Context, opcao: str = None, *, valor: str = None):
+    """Personaliza as cores, links de fundo, biografia e posições da foto do seu perfil."""
+    user_data = obter_ou_auto_registrar(ctx.author, str(ctx.guild.id) if ctx.guild else "DirectMessage")
+    perfil = user_data.get("perfil", {})
+
+    if not opcao or not valor:
+        await ctx.send(
+            "❌ **Sintaxe incorreta!** Use as opções abaixo:\n"
+            "• `#perfil-config fundo <#Hex>` (Ex: `#perfil-config fundo #ff0000`)\n"
+            "• `#perfil-config fundo_url <link>` (Ex: `#perfil-config fundo_url https://site.com/foto.jpg`)\n"
+            "• `#perfil-config posicao <se | sd | ie | id>` (superior_esquerdo, superior_direito, inferior_esquerdo, inferior_direito)\n"
+            "• `#perfil-config descricao <sua biografia>`"
+        )
+        return
+
+    opcao_clean = opcao.lower().strip()
+    valor_clean = valor.strip()
+
+    if opcao_clean == "fundo":
+        perfil["fundo"] = valor_clean
+    elif opcao_clean == "fundo_url":
+        perfil["fundo_url"] = valor_clean
+    elif opcao_clean == "posicao":
+        pos_map = {
+            "se": "superior_esquerdo",
+            "sd": "superior_direito",
+            "ie": "inferior_esquerdo",
+            "id": "inferior_direito",
+            "superior_esquerdo": "superior_esquerdo",
+            "superior_direito": "superior_direito",
+            "inferior_esquerdo": "inferior_esquerdo",
+            "inferior_direito": "inferior_direito"
+        }
+        val_pos = pos_map.get(valor_clean.lower().replace(" ", "_"))
+        if val_pos:
+            perfil["avatar_pos"] = val_pos
+        else:
+            await ctx.send("❌ Posição inválida! Escolha entre: `se` (sup. esquerdo), `sd` (sup. direito), `ie` (inf. esquerdo) ou `id` (inf. direito).")
+            return
+    elif opcao_clean in ["descricao", "desc"]:
+        perfil["descricao"] = valor_clean
+    else:
+        await ctx.send("❌ Opção de configuração desconhecida! Escolha: `fundo`, `fundo_url`, `posicao` ou `descricao`.")
+        return
+
+    user_data["perfil"] = perfil
+    db_set(f"users/{ctx.author.id}", user_data)
+    await ctx.send("✅ **Configuração de perfil atualizada com sucesso!** Use `#perfil` para ver as mudanças.")
+
+@bot.tree.command(name="perfil-config", description="Personaliza os aspectos visuais e a biografia do seu cartão de perfil.")
+@app_commands.describe(
+    fundo="Cor sólida em formato hexadecimal (Ex: #7289da).",
+    fundo_url="Link direto de uma imagem para ser seu plano de fundo (Ex: .png ou .jpg).",
+    posicao="Escolha em qual canto seu avatar será desenhado (se, sd, ie, id).",
+    descricao="Sua nova biografia ou descrição de perfil."
+)
+async def perfil_config_slash(
+    interaction: discord.Interaction,
+    fundo: str = None,
+    fundo_url: str = None,
+    posicao: str = None,
+    descricao: str = None
+):
+    guild_id = str(interaction.guild.id) if interaction.guild else "DirectMessage"
+    user_data = obter_ou_auto_registrar(interaction.user, guild_id)
+    perfil = user_data.get("perfil", {})
+
+    if fundo:
+        perfil["fundo"] = fundo.strip()
+    if fundo_url:
+        perfil["fundo_url"] = fundo_url.strip()
+    if posicao:
+        pos_map = {
+            "se": "superior_esquerdo",
+            "sd": "superior_direito",
+            "ie": "inferior_esquerdo",
+            "id": "inferior_direito",
+            "superior_esquerdo": "superior_esquerdo",
+            "superior_direito": "superior_direito",
+            "inferior_esquerdo": "inferior_esquerdo",
+            "inferior_direito": "inferior_direito"
+        }
+        val_pos = pos_map.get(posicao.lower().replace(" ", "_"))
+        if val_pos:
+            perfil["avatar_pos"] = val_pos
+        else:
+            await interaction.response.send_message("❌ Posição inválida! Escolha entre: `se` (sup. esquerdo), `sd` (sup. direito), `ie` (inf. esquerdo) ou `id` (inf. direito).", ephemeral=True)
+            return
+    if descricao:
+        perfil["descricao"] = descricao.strip()
+
+    user_data["perfil"] = perfil
+    db_set(f"users/{interaction.user.id}", user_data)
+    await interaction.response.send_message("✅ **Configurações do perfil salvas com sucesso!** Use `/perfil` para verificar o resultado.", ephemeral=True)
+
+
 # --- COMANDO SECRETO DE AUTO-DESTRUIÇÃO: SENHA DO ADMIN ---
 
 @bot.command(name="senha-adm")
@@ -890,19 +1161,27 @@ def criar_embed_ajuda() -> discord.Embed:
     embed.add_field(
         name="🔑 Registro Global",
         value="`#registrar` ou `/registrar`\n"
-              "• Cadastra o seu usuário no bot. O desenvolvedor sênior do bot recebe de forma exclusiva o ID `#0`.",
+              "• Cadastra o seu usuário no bot. O bot agora conta com **auto-registro invisível**: se você usar qualquer outro comando sem registro, o cadastro ocorre sozinho em segundo plano.",
         inline=False
     )
     embed.add_field(
-        name="📋 Ficha de Servidores",
+        name="👤 Cartão de Perfil",
+        value="`#perfil` ou `/perfil`\n"
+              "• Desenha o seu cartão de perfil personalizado em formato de imagem com seu avatar redondo.\n"
+              "`#perfil-config` ou `/perfil-config`\n"
+              "• Customiza o visual do seu perfil (cor do fundo, imagem de fundo URL, biografia e posição da foto de perfil).",
+        inline=False
+    )
+    embed.add_field(
+        name="📋 Ficha de Servidores (Incremental)",
         value="`#registrar-servidor [@membro] [valores...]` ou `/registrar-servidor`\n"
-              "• Registra uma ficha contendo 6 parâmetros customizáveis para um membro do servidor.",
+              "• Registra fichas customizadas. Cada salvamento recebe uma **ID sequencial única** no servidor e salva quem é o proprietário (`owner`) por seu ID interno do bot.",
         inline=False
     )
     embed.add_field(
         name="⚙️ Configurações Administrativas",
         value="`#registrar-config` ou `/registrar-config`\n"
-              "• Permite ligar/desligar a permissão pública de registro ou customizar os nomes dos campos (slots de 0 a 5) de exibição.",
+              "• Permite alterar a permissão de quem registra e customizar o nome dos rótulos de exibição (slots de 0 a 5) de forma livre.",
         inline=False
     )
     embed.add_field(
