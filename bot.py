@@ -324,7 +324,7 @@ def obter_metricas_comandos() -> tuple:
             return 0, 0.0
             
         quantidade = dados.get("quantidade", 0)
-        media = quantidade / 2.0 if quantidade > 0 else 0.0
+        media = quantity = quantidade / 2.0 if quantidade > 0 else 0.0
         return quantidade, media
     except Exception:
         return 0, 0.0
@@ -503,6 +503,96 @@ def logout():
     return redirect(url_for("admin"))
 
 
+# --- VIEW INTERATIVA: PAINEL ADMINISTRATIVO MASTER ---
+
+class PainelAdminView(discord.ui.View):
+    def __init__(self, bot_inst: commands.Bot, autor_id: int):
+        super().__init__(timeout=180)
+        self.bot = bot_inst
+        self.autor_id = autor_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Garante segurança estrita de bloqueio contra acessos não autorizados [1]
+        if interaction.user.id != self.autor_id:
+            await interaction.response.send_message("❌ **Acesso negado!** Apenas o administrador master do bot pode clicar nos botões.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Status do Sistema", style=discord.ButtonStyle.primary, emoji="🖥️")
+    async def status_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        bot_online = self.bot.is_ready()
+        latencia = f"{self.bot.latency * 1000:.0f}ms" if bot_online else "N/A"
+        servidores = len(self.bot.guilds)
+        
+        # Puxa quantidade de cadastros no cache local
+        users_db = db_get("users", {})
+        total_usuarios = len(users_db) if isinstance(users_db, dict) else 0
+        
+        next_id = db_get("global_config/proximo_bot_id", 1)
+        
+        embed = discord.Embed(
+            title="🖥️ Status Detalhado do Sistema",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Status da API", value="`ONLINE`" if bot_online else "`OFFLINE`", inline=True)
+        embed.add_field(name="Ping da API", value=f"`{latencia}`", inline=True)
+        embed.add_field(name="Guildas Conectadas", value=f"`{servidores}`", inline=True)
+        embed.add_field(name="Registros Totais (Banco)", value=f"`{total_usuarios}`", inline=True)
+        embed.add_field(name="Próximo ID Global", value=f"`#{next_id}`", inline=True)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Forçar Sync Gist", style=discord.ButtonStyle.secondary, emoji="🔄")
+    async def sync_gist_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            sincronizar_banco_local()
+            await interaction.followup.send("✅ **Sincronização forçada concluída!** O cache de RAM e o arquivo local foram atualizados com a nuvem do Gist.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Falha técnica ao sincronizar: {e}", ephemeral=True)
+
+    @discord.ui.button(label="Baixar Backup", style=discord.ButtonStyle.secondary, emoji="📁")
+    async def backup_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if os.path.exists("local_db.json"):
+            file = discord.File("local_db.json")
+            await interaction.response.send_message(content="📄 **Backup gerado!** Aqui está a cópia em tempo real do seu banco de dados local cacheado:", file=file, ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Nenhum arquivo de backup local `local_db.json` foi localizado no servidor.", ephemeral=True)
+
+    @discord.ui.button(label="Sincronizar Slash (/) ", style=discord.ButtonStyle.success, emoji="🔨")
+    async def sync_slash_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            synced = await self.bot.tree.sync()
+            await interaction.followup.send(f"✅ **Árvore de comandos sincronizada!** `{len(synced)}` comandos de barra atualizados globalmente no Discord.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Erro de upload de comandos: {e}", ephemeral=True)
+
+    @discord.ui.button(label="Ver Registros", style=discord.ButtonStyle.primary, emoji="👥")
+    async def ver_registros_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        users_db = db_get("users", {})
+        if not users_db or not isinstance(users_db, dict):
+            await interaction.response.send_message("🔍 Nenhum registro foi localizado na base de dados até o momento.", ephemeral=True)
+            return
+            
+        lista = []
+        for d_id, dados in users_db.items():
+            nome = dados.get("nome", "Desconhecido")
+            bot_id = dados.get("bot_id", "?")
+            lista.append(f"• ID Bot: `#{bot_id}` | `{nome}` (Discord: <@{d_id}>)")
+            
+        texto_lista = "\n".join(lista[:15])  # Limita a 15 para evitar quebras por limite de caracteres da Embed
+        if len(lista) > 15:
+            texto_lista += f"\n*... e outros {len(lista) - 15} registros.*"
+            
+        embed = discord.Embed(
+            title="👥 Diretório de Usuários Cadastrados",
+            description=texto_lista if lista else "Diretório vazio.",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # --- COMANDOS: UTILS ---
 
 @bot.command(name="ping")
@@ -570,17 +660,72 @@ async def registrar_prefix(ctx: commands.Context):
     user_id = str(ctx.author.id)
     guild_id = str(ctx.guild.id) if ctx.guild else "DirectMessage"
     
-    # Auto-registrador cuida do processo
-    user_data = obter_ou_auto_registrar(ctx.author, guild_id)
-    await ctx.send(f"🎉 **Registro Concluído!** ID do Bot: `#{user_data['bot_id']}` | ID do Discord: `{user_id}`")
+    # Verifica duplicidade no banco
+    user_data = db_get(f"users/{user_id}")
+    if user_data:
+        await ctx.send(f"⚠️ **Você já está registrado!** Seu ID de usuário no bot é `#{user_data['bot_id']}`.")
+        return
+
+    if ctx.author.id == DONO_BOT_ID:
+        bot_id = 0  # Dono do bot possui de forma estrita o ID 0
+    else:
+        # Incrementa o contador na nuvem para evitar colisões
+        next_id = db_get("global_config/proximo_bot_id", 1)
+        bot_id = next_id
+        db_set("global_config/proximo_bot_id", next_id + 1)
+        
+    novo_cadastro = {
+        "discord_id": user_id,
+        "guild_id": guild_id,
+        "bot_id": bot_id
+    }
+    db_set(f"users/{user_id}", novo_cadastro)
+    
+    embed = discord.Embed(
+        title="🎉 Registro Concluído com Sucesso!",
+        description=f"Seja bem-vindo, {ctx.author.mention}!",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="ID no Bot", value=f"`#{bot_id}`", inline=True)
+    embed.add_field(name="ID do Discord", value=f"`{user_id}`", inline=True)
+    if ctx.guild:
+        embed.add_field(name="Servidor Principal", value=f"`{ctx.guild.name}`", inline=False)
+        
+    await ctx.send(embed=embed)
 
 @bot.tree.command(name="registrar", description="Registra seu usuário globalmente no banco de dados do bot.")
 async def registrar_slash(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     guild_id = str(interaction.guild.id) if interaction.guild else "DirectMessage"
     
-    user_data = obter_ou_auto_registrar(interaction.user, guild_id)
-    await interaction.response.send_message(f"🎉 **Registro Concluído!** ID do Bot: `#{user_data['bot_id']}` | ID do Discord: `{user_id}`")
+    user_data = db_get(f"users/{user_id}")
+    if user_data:
+        await interaction.response.send_message(f"⚠️ **Você já está registrado!** Seu ID de usuário no bot é `#{user_data['bot_id']}`.", ephemeral=True)
+        return
+
+    if interaction.user.id == DONO_BOT_ID:
+        bot_id = 0
+    else:
+        next_id = db_get("global_config/proximo_bot_id", 1)
+        bot_id = next_id
+        db_set("global_config/proximo_bot_id", next_id + 1)
+        
+    novo_cadastro = {
+        "discord_id": user_id,
+        "guild_id": guild_id,
+        "bot_id": bot_id
+    }
+    db_set(f"users/{user_id}", novo_cadastro)
+    
+    embed = discord.Embed(
+        title="🎉 Registro Concluído com Sucesso!",
+        description=f"Seja bem-vindo, {interaction.user.mention}!",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="ID no Bot", value=f"`#{bot_id}`", inline=True)
+    embed.add_field(name="ID do Discord", value=f"`{user_id}`", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
 
 
 # 2. COMANDO #registrar-servidor / /registrar-servidor
@@ -659,7 +804,7 @@ async def registrar_servidor_prefix(ctx: commands.Context, membro: discord.Membe
     
     embed = discord.Embed(
         title=f"📋 Ficha de Servidor Registrada (ID: #{proximo_reg_id})!",
-        description=f"O membro {membro.mention} recebeu uma ficha de registro. Criada pelo ID do Bot `#{bot_id_owner}`.",
+        description=f"O membro {membro.mention} recebeu uma ficha de registro associada a este servidor.",
         color=discord.Color.blue()
     )
     embed.add_field(name=labels["0"], value=f"`{nomes[0]}`", inline=True)
@@ -751,8 +896,8 @@ async def registrar_servidor_slash(
     db_set(f"server_registrations/{guild_id}/{membro.id}", registro_membro)
     
     embed = discord.Embed(
-        title=f"📋 Ficha de Servidor Registrada (ID: #{proximo_reg_id})!",
-        description=f"O membro {membro.mention} recebeu uma ficha de registro. Criada pelo ID do Bot `#{bot_id_owner}`.",
+        title="📋 Ficha de Servidor Registrada!",
+        description=f"O membro {membro.mention} recebeu uma ficha de registro associada a este servidor.",
         color=discord.Color.blue()
     )
     embed.add_field(name=labels["0"], value=f"`{nome}`", inline=True)
@@ -1135,6 +1280,39 @@ async def senha_adm_slash(interaction: discord.Interaction):
         await interaction.response.send_message(f"❌ Não consegui enviar DM. Verifique se as mensagens privadas estão abertas! Detalhes: {e}", ephemeral=True)
 
 
+# --- COMANDO EXCLUSIVO: PAINEL ADMINISTRATIVO MASTER ---
+
+@bot.command(name="painel-adm")
+async def painel_adm_prefix(ctx: commands.Context):
+    """Abre o painel interativo de administração master (Apenas para o dono do bot)."""
+    if ctx.author.id != DONO_BOT_ID:
+        await ctx.send("❌ **Acesso negado!** Apenas o dono do bot pode utilizar o painel administrativo.")
+        return
+        
+    embed = discord.Embed(
+        title="⚙️ Painel de Controle - Administração Master",
+        description="Selecione uma das opções nos botões abaixo para gerenciar a nuvem e o status do bot:",
+        color=discord.Color.dark_red()
+    )
+    view = PainelAdminView(bot, ctx.author.id)
+    await ctx.send(embed=embed, view=view)
+
+@bot.tree.command(name="painel-adm", description="Abre o painel interativo de administração master (Apenas para o dono do bot).")
+async def painel_adm_slash(interaction: discord.Interaction):
+    """Abre o painel de forma efêmera (privada) para o dono."""
+    if interaction.user.id != DONO_BOT_ID:
+        await interaction.response.send_message("❌ **Acesso negado!** Apenas o dono do bot pode usar este painel.", ephemeral=True)
+        return
+        
+    embed = discord.Embed(
+        title="⚙️ Painel de Controle - Administração Master",
+        description="Selecione uma das opções nos botões abaixo para gerenciar a nuvem e o status do bot:",
+        color=discord.Color.dark_red()
+    )
+    view = PainelAdminView(bot, interaction.user.id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
 # --- INTERCEPTORES DE EVENTO PARA MÉTRICAS (MÉDIA DE USO) ---
 
 @bot.before_invoke
@@ -1159,13 +1337,13 @@ def criar_embed_ajuda() -> discord.Embed:
         color=discord.Color.blue()
     )
     embed.add_field(
-        name="🔑 Registro Global",
+        name="🔑 Registro Global (Auto-Registro)",
         value="`#registrar` ou `/registrar`\n"
               "• Cadastra o seu usuário no bot. O bot agora conta com **auto-registro invisível**: se você usar qualquer outro comando sem registro, o cadastro ocorre sozinho em segundo plano.",
         inline=False
     )
     embed.add_field(
-        name="👤 Cartão de Perfil",
+        name="👤 Cartão de Perfil (Customizável)",
         value="`#perfil` ou `/perfil`\n"
               "• Desenha o seu cartão de perfil personalizado em formato de imagem com seu avatar redondo.\n"
               "`#perfil-config` ou `/perfil-config`\n"
@@ -1197,7 +1375,9 @@ def criar_embed_ajuda() -> discord.Embed:
         value="`#ping` ou `/ping`\n"
               "• Mostra o tempo de latência de comunicação com a API do Discord em milissegundos.\n"
               "`#senha-adm` ou `/senha-adm`\n"
-              "• Protocolo exclusivo de segurança do criador: Envia a senha master na DM e se auto-destrói em 5 segundos.",
+              "• Protocolo exclusivo de segurança do criador: Envia a senha master na DM e se auto-destrói em 5 segundos.\n"
+              "`#painel-adm` ou `/painel-adm`\n"
+              "• Abre o painel master com botões interativos para controle do sistema (Exclusivo do Dono).",
         inline=False
     )
     embed.set_footer(text="scn_bot - Nova Geração de Bots")
