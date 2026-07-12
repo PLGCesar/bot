@@ -35,6 +35,7 @@ COMANDOS_TMP_FILE = "comandos_hora.tmp"
 
 # --- ENGENHARIA DE BANCO DE DADOS EM NUVEM (GITHUB GIST DB) ---
 
+# Cache local para evitar requisições desnecessárias (evita rate-limit do GitHub)
 _local_cache = {}
 
 def sincronizar_banco_local():
@@ -664,17 +665,72 @@ async def registrar_prefix(ctx: commands.Context):
     user_id = str(ctx.author.id)
     guild_id = str(ctx.guild.id) if ctx.guild else "DirectMessage"
     
-    # Auto-registrador cuida do processo
-    user_data = obter_ou_auto_registrar(ctx.author, guild_id)
-    await ctx.send(f"🎉 **Registro Concluído!** ID do Bot: `#{user_data['bot_id']}` | ID do Discord: `{user_id}`")
+    # Verifica duplicidade no banco
+    user_data = db_get(f"users/{user_id}")
+    if user_data:
+        await ctx.send(f"⚠️ **Você já está registrado!** Seu ID de usuário no bot é `#{user_data['bot_id']}`.")
+        return
+
+    if ctx.author.id == DONO_BOT_ID:
+        bot_id = 0  # Dono do bot possui de forma estrita o ID 0
+    else:
+        # Incrementa o contador na nuvem para evitar colisões
+        next_id = db_get("global_config/proximo_bot_id", 1)
+        bot_id = next_id
+        db_set("global_config/proximo_bot_id", next_id + 1)
+        
+    novo_cadastro = {
+        "discord_id": user_id,
+        "guild_id": guild_id,
+        "bot_id": bot_id
+    }
+    db_set(f"users/{user_id}", novo_cadastro)
+    
+    embed = discord.Embed(
+        title="🎉 Registro Concluído com Sucesso!",
+        description=f"Seja bem-vindo, {ctx.author.mention}!",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="ID no Bot", value=f"`#{bot_id}`", inline=True)
+    embed.add_field(name="ID do Discord", value=f"`{user_id}`", inline=True)
+    if ctx.guild:
+        embed.add_field(name="Servidor Principal", value=f"`{ctx.guild.name}`", inline=False)
+        
+    await ctx.send(embed=embed)
 
 @bot.tree.command(name="registrar", description="Registra seu usuário globalmente no banco de dados do bot.")
 async def registrar_slash(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     guild_id = str(interaction.guild.id) if interaction.guild else "DirectMessage"
     
-    user_data = obter_ou_auto_registrar(interaction.user, guild_id)
-    await interaction.response.send_message(f"🎉 **Registro Concluído!** ID do Bot: `#{user_data['bot_id']}` | ID do Discord: `{user_id}`")
+    user_data = db_get(f"users/{user_id}")
+    if user_data:
+        await interaction.response.send_message(f"⚠️ **Você já está registrado!** Seu ID de usuário no bot é `#{user_data['bot_id']}`.", ephemeral=True)
+        return
+
+    if interaction.user.id == DONO_BOT_ID:
+        bot_id = 0
+    else:
+        next_id = db_get("global_config/proximo_bot_id", 1)
+        bot_id = next_id
+        db_set("global_config/proximo_bot_id", next_id + 1)
+        
+    novo_cadastro = {
+        "discord_id": user_id,
+        "guild_id": guild_id,
+        "bot_id": bot_id
+    }
+    db_set(f"users/{user_id}", novo_cadastro)
+    
+    embed = discord.Embed(
+        title="🎉 Registro Concluído com Sucesso!",
+        description=f"Seja bem-vindo, {interaction.user.mention}!",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="ID no Bot", value=f"`#{bot_id}`", inline=True)
+    embed.add_field(name="ID do Discord", value=f"`{user_id}`", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
 
 
 # 2. COMANDO #registrar-servidor / /registrar-servidor
@@ -1229,39 +1285,6 @@ async def senha_adm_slash(interaction: discord.Interaction):
         
     except Exception as e:
         await interaction.response.send_message(f"❌ Não consegui enviar DM. Verifique se as mensagens privadas estão abertas! Detalhes: {e}", ephemeral=True)
-
-
-# --- COMANDO EXCLUSIVO: PAINEL ADMINISTRATIVO MASTER ---
-
-@bot.command(name="painel-adm")
-async def painel_adm_prefix(ctx: commands.Context):
-    """Abre o painel interativo de administração master (Apenas para o dono do bot)."""
-    if ctx.author.id != DONO_BOT_ID:
-        await ctx.send("❌ **Acesso negado!** Apenas o dono do bot pode utilizar o painel administrativo.")
-        return
-        
-    embed = discord.Embed(
-        title="⚙️ Painel de Controle - Administração Master",
-        description="Selecione uma das opções nos botões abaixo para gerenciar a nuvem e o status do bot:",
-        color=discord.Color.dark_red()
-    )
-    view = PainelAdminView(bot, ctx.author.id)
-    await ctx.send(embed=embed, view=view)
-
-@bot.tree.command(name="painel-adm", description="Abre o painel interativo de administração master (Apenas para o dono do bot).")
-async def painel_adm_slash(interaction: discord.Interaction):
-    """Abre o painel de forma efêmera (privada) para o dono."""
-    if interaction.user.id != DONO_BOT_ID:
-        await interaction.response.send_message("❌ **Acesso negado!** Apenas o dono do bot pode usar este painel.", ephemeral=True)
-        return
-        
-    embed = discord.Embed(
-        title="⚙️ Painel de Controle - Administração Master",
-        description="Selecione uma das opções nos botões abaixo para gerenciar a nuvem e o status do bot:",
-        color=discord.Color.dark_red()
-    )
-    view = PainelAdminView(bot, interaction.user.id)
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 # --- NOVOS REQUISITOS: AUTO-ROLE POR BOTÕES & FAQ & ANTIRAID ---
