@@ -1795,6 +1795,11 @@ async def monitorados_slash(interaction: discord.Interaction):
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
     """Detecta se um membro monitorado recebeu permissões administrativas, removendo o cargo dele e de quem o promoveu."""
+    
+    # IMPORTANTE: Ignora o próprio bot pra não se auto-monitorar
+    if after.id == bot.user.id:
+        return
+    
     guild_id = str(after.guild.id)
     
     # Busca a lista de IDs sob monitoramento no servidor
@@ -1840,6 +1845,11 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     break
         except Exception as e:
             logger.error(f"ANTIRAID: Falha ao ler logs de auditoria: {e}")
+        
+        # IMPORTANTE: Ignora se quem promoveu foi o próprio bot (não se auto-punir)
+        if quem_promoveu and quem_promoveu.id == bot.user.id:
+            logger.info(f"ANTIRAID: Promoção foi feita pelo bot (ignorado). User: {after.name}")
+            return
             
         # 3. Se identificarmos quem deu o cargo, removemos todos os cargos administrativos dele (se possível)
         if quem_promoveu and isinstance(quem_promoveu, discord.Member):
