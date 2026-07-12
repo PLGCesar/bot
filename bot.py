@@ -22,6 +22,7 @@ DONO_BOT_ID = 1520539744457461892
 # --- CONFIGURAÇÃO DO BOT DO DISCORD ---
 intents = discord.Intents.default()
 intents.message_content = True 
+intents.members = True       # IMPORTANTE: Requerido para o on_member_update e moderação ativa
 
 # help_command=None desativa de forma estrita a ajuda padrão de texto do discord.py
 bot = commands.Bot(command_prefix="#", intents=intents, help_command=None)
@@ -34,7 +35,6 @@ COMANDOS_TMP_FILE = "comandos_hora.tmp"
 
 # --- ENGENHARIA DE BANCO DE DADOS EM NUVEM (GITHUB GIST DB) ---
 
-# Cache local para evitar requisições desnecessárias (evita rate-limit do GitHub)
 _local_cache = {}
 
 def sincronizar_banco_local():
@@ -129,7 +129,7 @@ def db_set(path: str, value) -> bool:
         except Exception as e:
             print(f"[Erro Gist DB] Falha ao enviar modificações: {e}")
             
-    return not (GITHUB_TOKEN and GIST_ID)  # Retorna True se rodando localmente sem Gist
+    return not (GITHUB_TOKEN and GIST_ID)
 
 
 # --- MÓDULO DE BANCO DE DADOS DE USUÁRIOS (REGISTRO DINÂMICO) ---
@@ -664,72 +664,17 @@ async def registrar_prefix(ctx: commands.Context):
     user_id = str(ctx.author.id)
     guild_id = str(ctx.guild.id) if ctx.guild else "DirectMessage"
     
-    # Verifica duplicidade no banco
-    user_data = db_get(f"users/{user_id}")
-    if user_data:
-        await ctx.send(f"⚠️ **Você já está registrado!** Seu ID de usuário no bot é `#{user_data['bot_id']}`.")
-        return
-
-    if ctx.author.id == DONO_BOT_ID:
-        bot_id = 0  # Dono do bot possui de forma estrita o ID 0
-    else:
-        # Incrementa o contador na nuvem para evitar colisões
-        next_id = db_get("global_config/proximo_bot_id", 1)
-        bot_id = next_id
-        db_set("global_config/proximo_bot_id", next_id + 1)
-        
-    novo_cadastro = {
-        "discord_id": user_id,
-        "guild_id": guild_id,
-        "bot_id": bot_id
-    }
-    db_set(f"users/{user_id}", novo_cadastro)
-    
-    embed = discord.Embed(
-        title="🎉 Registro Concluído com Sucesso!",
-        description=f"Seja bem-vindo, {ctx.author.mention}!",
-        color=discord.Color.green()
-    )
-    embed.add_field(name="ID no Bot", value=f"`#{bot_id}`", inline=True)
-    embed.add_field(name="ID do Discord", value=f"`{user_id}`", inline=True)
-    if ctx.guild:
-        embed.add_field(name="Servidor Principal", value=f"`{ctx.guild.name}`", inline=False)
-        
-    await ctx.send(embed=embed)
+    # Auto-registrador cuida do processo
+    user_data = obter_ou_auto_registrar(ctx.author, guild_id)
+    await ctx.send(f"🎉 **Registro Concluído!** ID do Bot: `#{user_data['bot_id']}` | ID do Discord: `{user_id}`")
 
 @bot.tree.command(name="registrar", description="Registra seu usuário globalmente no banco de dados do bot.")
 async def registrar_slash(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     guild_id = str(interaction.guild.id) if interaction.guild else "DirectMessage"
     
-    user_data = db_get(f"users/{user_id}")
-    if user_data:
-        await interaction.response.send_message(f"⚠️ **Você já está registrado!** Seu ID de usuário no bot é `#{user_data['bot_id']}`.", ephemeral=True)
-        return
-
-    if interaction.user.id == DONO_BOT_ID:
-        bot_id = 0
-    else:
-        next_id = db_get("global_config/proximo_bot_id", 1)
-        bot_id = next_id
-        db_set("global_config/proximo_bot_id", next_id + 1)
-        
-    novo_cadastro = {
-        "discord_id": user_id,
-        "guild_id": guild_id,
-        "bot_id": bot_id
-    }
-    db_set(f"users/{user_id}", novo_cadastro)
-    
-    embed = discord.Embed(
-        title="🎉 Registro Concluído com Sucesso!",
-        description=f"Seja bem-vindo, {interaction.user.mention}!",
-        color=discord.Color.green()
-    )
-    embed.add_field(name="ID no Bot", value=f"`#{bot_id}`", inline=True)
-    embed.add_field(name="ID do Discord", value=f"`{user_id}`", inline=True)
-    
-    await interaction.response.send_message(embed=embed)
+    user_data = obter_ou_auto_registrar(interaction.user, guild_id)
+    await interaction.response.send_message(f"🎉 **Registro Concluído!** ID do Bot: `#{user_data['bot_id']}` | ID do Discord: `{user_id}`")
 
 
 # 2. COMANDO #registrar-servidor / /registrar-servidor
@@ -941,7 +886,7 @@ async def registrar_config_prefix(ctx: commands.Context, sub_comando: str = None
                        "• `#registrar-config label <0 a 5> <Novo Nome>` - Altera o nome/rótulo dos campos de registro.")
         return
 
-    # Sub-comando 1: Configuração de Permissão Geral (True ou False) - CORRIGIDO
+    # Sub-comando 1: Configuração de Permissão Geral (True ou False)
     if sub_comando.lower() in ["true", "false", "sim", "nao", "não", "ativo", "ativado", "desativado", "inativo"]:
         val_bool = None
         sub_cmd = sub_comando.lower()
@@ -1319,7 +1264,441 @@ async def painel_adm_slash(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-# --- INTERCEPTORES DE EVENTO PARA MÉTRICAS (MÉDIA DE USO) ---
+# --- NOVOS REQUISITOS: AUTO-ROLE POR BOTÕES & FAQ & ANTIRAID ---
+
+# 1. AUTO-ROLE POR BOTÕES (#painel-cargos e /painel-cargos)
+@bot.command(name="painel-cargos")
+async def painel_cargos_prefix(ctx: commands.Context, titulo: str, descricao: str, *cargos: discord.Role):
+    """Gera um painel com botões persistentes e vitalícios de cargos."""
+    # Garante o auto-registro no primeiro comando usado
+    obter_ou_auto_registrar(ctx.author, str(ctx.guild.id) if ctx.guild else "DirectMessage")
+
+    if not (ctx.author.guild_permissions.administrator or ctx.author.id == ctx.guild.owner_id or ctx.author.id == DONO_BOT_ID):
+        await ctx.send("❌ **Acesso negado!** Apenas administradores do servidor podem criar painéis de cargos.")
+        return
+    if not cargos:
+        await ctx.send("❌ Forneça pelo menos um cargo marcado! Exemplo: `#painel-cargos \"Cargos\" \"Escolha abaixo:\" @Notificacoes`")
+        return
+
+    embed = discord.Embed(title=titulo, description=descricao, color=discord.Color.blue())
+    view = discord.ui.View(timeout=None)
+    for r in cargos[:5]:  # Limita a 5 por questão de espaço e alinhamento
+        view.add_item(discord.ui.Button(
+            label=r.name,
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"role_{r.id}"
+        ))
+    await ctx.send(embed=embed, view=view)
+
+@bot.tree.command(name="painel-cargos", description="Gera um painel com botões de cargos selecionados.")
+@app_commands.describe(
+    titulo="Título do painel.",
+    descricao="Instruções para o painel.",
+    cargo1="Primeiro cargo vinculado.",
+    cargo2="Segundo cargo (Opcional).",
+    cargo3="Terceiro cargo (Opcional).",
+    cargo4="Quarto cargo (Opcional).",
+    cargo5="Quinto cargo (Opcional)."
+)
+async def painel_cargos_slash(
+    interaction: discord.Interaction,
+    titulo: str,
+    descricao: str,
+    cargo1: discord.Role,
+    cargo2: discord.Role = None,
+    cargo3: discord.Role = None,
+    cargo4: discord.Role = None,
+    cargo5: discord.Role = None
+):
+    """Cria o painel de cargos de forma nativa e persistente via Slash Command."""
+    guild_id = str(interaction.guild.id) if interaction.guild else "DirectMessage"
+    obter_ou_auto_registrar(interaction.user, guild_id)
+
+    if not (interaction.user.guild_permissions.administrator or interaction.user.id == interaction.guild.owner_id or interaction.user.id == DONO_BOT_ID):
+        await interaction.response.send_message("❌ Apenas administradores podem criar painéis de cargos.", ephemeral=True)
+        return
+
+    roles_list = [cargo1]
+    for c in [cargo2, cargo3, cargo4, cargo5]:
+        if c:
+            roles_list.append(c)
+
+    embed = discord.Embed(title=titulo, description=descricao, color=discord.Color.blue())
+    
+    view = discord.ui.View(timeout=None)
+    for r in roles_list:
+        view.add_item(discord.ui.Button(
+            label=r.name,
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"role_{r.id}"
+        ))
+
+    await interaction.response.send_message(embed=embed, view=view)
+
+
+# 2. GERENCIADOR DE FAQS / RESPOSTAS RÁPIDAS (#faq e /faq)
+@bot.command(name="faq")
+async def faq_prefix(ctx: commands.Context, sub_comando: str = None, chave: str = None, *, resposta: str = None):
+    """Gerencia ou exibe respostas rápidas (FAQ) do servidor."""
+    # Garante o auto-registro no primeiro comando usado
+    obter_ou_auto_registrar(ctx.author, str(ctx.guild.id) if ctx.guild else "DirectMessage")
+
+    guild_id = str(ctx.guild.id) if ctx.guild else "DirectMessage"
+    
+    if not sub_comando:
+        await ctx.send("❌ **Como usar o FAQ:**\n"
+                       "• `#faq <chave>` - Exibe a resposta salva para essa chave.\n"
+                       "• `#faq add <chave> <resposta>` - Adiciona uma resposta rápida (Apenas Admins).\n"
+                       "• `#faq del <chave>` - Remove uma resposta rápida (Apenas Admins).\n"
+                       "• `#faq list` - Lista todas as respostas rápidas salvas.")
+        return
+
+    sub_clean = sub_comando.lower().strip()
+    
+    if sub_clean == "list":
+        faqs = db_get(f"server_faqs/{guild_id}", {})
+        if not faqs:
+            await ctx.send("🔍 Nenhuma resposta rápida (FAQ) cadastrada neste servidor ainda.")
+            return
+        lista = [f"• `{k}`" for k in faqs.keys()]
+        embed = discord.Embed(title="📚 Respostas Rápidas Cadastradas", description="\n".join(lista), color=discord.Color.blue())
+        await ctx.send(embed=embed)
+        return
+        
+    elif sub_clean == "add":
+        if not (ctx.author.guild_permissions.administrator or ctx.author.id == ctx.guild.owner_id or ctx.author.id == DONO_BOT_ID):
+            await ctx.send("❌ Apenas administradores do servidor podem adicionar FAQs.")
+            return
+        if not chave or not resposta:
+            await ctx.send("❌ **Sintaxe incorreta!** Use: `#faq add <chave> <sua resposta aqui>`")
+            return
+        
+        db_set(f"server_faqs/{guild_id}/{chave.lower()}", resposta)
+        await ctx.send(f"✅ **FAQ `{chave.lower()}` cadastrado com sucesso!**")
+        return
+        
+    elif sub_clean in ["del", "delete"]:
+        if not (ctx.author.guild_permissions.administrator or ctx.author.id == ctx.guild.owner_id or ctx.author.id == DONO_BOT_ID):
+            await ctx.send("❌ Apenas administradores do servidor podem remover FAQs.")
+            return
+        if not chave:
+            await ctx.send("❌ **Sintaxe incorreta!** Use: `#faq del <chave>`")
+            return
+        
+        db_set(f"server_faqs/{guild_id}/{chave.lower()}", None)
+        await ctx.send(f"✅ **FAQ `{chave.lower()}` removido com sucesso!**")
+        return
+        
+    else:
+        # Se digitar apenas #faq <chave>
+        chave_busca = sub_comando.lower()
+        resposta_salva = db_get(f"server_faqs/{guild_id}/{chave_busca}")
+        if resposta_salva:
+            await ctx.send(resposta_salva)
+        else:
+            await ctx.send(f"❌ **FAQ não encontrado!** Não encontrei nenhuma resposta rápida para `{chave_busca}`. Digite `#faq list` para ver as disponíveis.")
+
+@bot.tree.command(name="faq", description="Exibe ou gerencia respostas rápidas do servidor.")
+@app_commands.describe(
+    chave="A palavra-chave do FAQ a ser pesquisada ou alterada.",
+    acao="Escolha 'add' (adicionar), 'del' (deletar) ou 'get' (obter, padrão).",
+    resposta="A resposta para a chave (necessário apenas na ação de adicionar)."
+)
+async def faq_slash(interaction: discord.Interaction, chave: str, acao: str = "get", resposta: str = None):
+    """Módulo de FAQ privado (ephemeral) para o Slash Command."""
+    guild_id = str(interaction.guild.id) if interaction.guild else "DirectMessage"
+    obter_ou_auto_registrar(interaction.user, guild_id)
+
+    acao_clean = acao.lower().strip()
+    chave_clean = chave.lower().strip()
+
+    if acao_clean == "get":
+        resposta_salva = db_get(f"server_faqs/{guild_id}/{chave_clean}")
+        if resposta_salva:
+            await interaction.response.send_message(resposta_salva)
+        else:
+            await interaction.response.send_message(f"❌ **FAQ não encontrado!** Nenhuma resposta rápida para `{chave_clean}`.", ephemeral=True)
+            
+    elif acao_clean == "add":
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id == interaction.guild.owner_id or interaction.user.id == DONO_BOT_ID):
+            await interaction.response.send_message("❌ Apenas administradores do servidor podem adicionar FAQs.", ephemeral=True)
+            return
+        if not resposta:
+            await interaction.response.send_message("❌ **Parâmetro ausente!** Forneça uma resposta para a chave.", ephemeral=True)
+            return
+        
+        db_set(f"server_faqs/{guild_id}/{chave_clean}", resposta)
+        await interaction.response.send_message(f"✅ **FAQ `{chave_clean}` cadastrado com sucesso!**", ephemeral=True)
+        
+    elif acao_clean in ["del", "delete"]:
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id == interaction.guild.owner_id or interaction.user.id == DONO_BOT_ID):
+            await interaction.response.send_message("❌ Apenas administradores do servidor podem remover FAQs.", ephemeral=True)
+            return
+        
+        db_set(f"server_faqs/{guild_id}/{chave_clean}", None)
+        await interaction.response.send_message(f"✅ **FAQ `{chave_clean}` removido com sucesso!**", ephemeral=True)
+
+
+# 3. ESCUDO ANTIRAID DE MONITORAMENTO DE SEGURANÇA (#monitorar, #desmonitorar, #monitorados)
+@bot.command(name="monitorar")
+async def monitorar_prefix(ctx: commands.Context, user_id: str = None):
+    """Adiciona um ID do Discord à lista de monitoramento do Antiraid."""
+    obter_ou_auto_registrar(ctx.author, str(ctx.guild.id) if ctx.guild else "DirectMessage")
+
+    if not (ctx.author.guild_permissions.administrator or ctx.author.id == ctx.guild.owner_id or ctx.author.id == DONO_BOT_ID):
+        await ctx.send("❌ Apenas administradores podem configurar o monitoramento.")
+        return
+    if not user_id:
+        await ctx.send("❌ Forneça o ID do Discord a ser monitorado.")
+        return
+        
+    guild_id = str(ctx.guild.id)
+    monitorados = db_get(f"server_config/{guild_id}/monitorados", [])
+    if user_id in monitorados:
+        await ctx.send("⚠️ Este ID já está na lista de monitoramento.")
+        return
+        
+    monitorados.append(user_id)
+    db_set(f"server_config/{guild_id}/monitorados", monitorados)
+    await ctx.send(f"🛡️ **ID `{user_id}` adicionado à lista de monitoramento de segurança!** Se este usuário receber cargos administrativos, a ação será revertida e o responsável será punido.")
+
+@bot.tree.command(name="monitorar", description="Adiciona um ID do Discord à lista de monitoramento de segurança.")
+@app_commands.describe(user_id="O ID do Discord do usuário que deseja monitorar.")
+async def monitorar_slash(interaction: discord.Interaction, user_id: str):
+    """Monitora um ID de forma privada via Slash Command."""
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Este comando só pode ser utilizado dentro de um servidor.", ephemeral=True)
+        return
+
+    guild_id = str(interaction.guild.id)
+    obter_ou_auto_registrar(interaction.user, guild_id)
+
+    if not (interaction.user.guild_permissions.administrator or interaction.user.id == interaction.guild.owner_id or interaction.user.id == DONO_BOT_ID):
+        await interaction.response.send_message("❌ Apenas administradores podem configurar o monitoramento.", ephemeral=True)
+        return
+        
+    monitorados = db_get(f"server_config/{guild_id}/monitorados", [])
+    if user_id in monitorados:
+        await interaction.response.send_message("⚠️ Este ID já está na lista de monitoramento.", ephemeral=True)
+        return
+        
+    monitorados.append(user_id)
+    db_set(f"server_config/{guild_id}/monitorados", monitorados)
+    await interaction.response.send_message(f"🛡️ **ID `{user_id}` adicionado à lista de monitoramento de segurança!** Se este usuário receber cargos administrativos, a ação será revertida e o responsável será punido.", ephemeral=True)
+
+@bot.command(name="desmonitorar")
+async def desmonitorar_prefix(ctx: commands.Context, user_id: str = None):
+    """Remove um ID do Discord da lista de monitoramento."""
+    obter_ou_auto_registrar(ctx.author, str(ctx.guild.id) if ctx.guild else "DirectMessage")
+
+    if not (ctx.author.guild_permissions.administrator or ctx.author.id == ctx.guild.owner_id or ctx.author.id == DONO_BOT_ID):
+        await ctx.send("❌ Apenas administradores podem configurar o monitoramento.")
+        return
+    if not user_id:
+        await ctx.send("❌ Forneça o ID do Discord a ser removido.")
+        return
+        
+    guild_id = str(ctx.guild.id)
+    monitorados = db_get(f"server_config/{guild_id}/monitorados", [])
+    if user_id not in monitorados:
+        await ctx.send("❌ Este ID não está na lista de monitoramento.")
+        return
+        
+    monitorados.remove(user_id)
+    db_set(f"server_config/{guild_id}/monitorados", monitorados)
+    await ctx.send(f"✅ ID `{user_id}` removido da lista de monitoramento de segurança com sucesso.")
+
+@bot.tree.command(name="desmonitorar", description="Remove um ID do Discord da lista de monitoramento de segurança.")
+@app_commands.describe(user_id="O ID do Discord do usuário que deseja remover.")
+async def desmonitorar_slash(interaction: discord.Interaction, user_id: str):
+    """Remove um ID monitorado de forma privada."""
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Este comando só pode ser utilizado dentro de um servidor.", ephemeral=True)
+        return
+
+    guild_id = str(interaction.guild.id)
+    obter_ou_auto_registrar(interaction.user, guild_id)
+
+    if not (interaction.user.guild_permissions.administrator or interaction.user.id == interaction.guild.owner_id or interaction.user.id == DONO_BOT_ID):
+        await interaction.response.send_message("❌ Apenas administradores podem configurar o monitoramento.", ephemeral=True)
+        return
+        
+    monitorados = db_get(f"server_config/{guild_id}/monitorados", [])
+    if user_id not in monitorados:
+        await interaction.response.send_message("❌ Este ID não está na lista de monitoramento.", ephemeral=True)
+        return
+        
+    monitorados.remove(user_id)
+    db_set(f"server_config/{guild_id}/monitorados", monitorados)
+    await interaction.response.send_message(f"✅ ID `{user_id}` removido do monitoramento com sucesso.", ephemeral=True)
+
+@bot.command(name="monitorados")
+async def monitorados_prefix(ctx: commands.Context):
+    """Lista todos os IDs sob monitoramento de segurança neste servidor."""
+    obter_ou_auto_registrar(ctx.author, str(ctx.guild.id) if ctx.guild else "DirectMessage")
+
+    if not (ctx.author.guild_permissions.administrator or ctx.author.id == ctx.guild.owner_id or ctx.author.id == DONO_BOT_ID):
+        await ctx.send("❌ Apenas administradores podem ver a lista de monitorados.")
+        return
+        
+    guild_id = str(ctx.guild.id)
+    monitorados = db_get(f"server_config/{guild_id}/monitorados", [])
+    if not monitorados:
+        await ctx.send("🛡️ Nenhum usuário está sendo monitorado neste servidor atualmente.")
+        return
+        
+    lista = [f"• `{uid}` (<@{uid}>)" for uid in monitorados]
+    embed = discord.Embed(title="🛡️ IDs Sob Monitoramento de Segurança", description="\n".join(lista), color=discord.Color.red())
+    await ctx.send(embed=embed)
+
+@bot.tree.command(name="monitorados", description="Lista todos os IDs sob monitoramento de segurança neste servidor.")
+async def monitorados_slash(interaction: discord.Interaction):
+    """Lista monitorados de forma privada."""
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Este comando só pode ser utilizado dentro de um servidor.", ephemeral=True)
+        return
+
+    guild_id = str(interaction.guild.id)
+    obter_ou_auto_registrar(interaction.user, guild_id)
+
+    if not (interaction.user.guild_permissions.administrator or interaction.user.id == interaction.guild.owner_id or interaction.user.id == DONO_BOT_ID):
+        await interaction.response.send_message("❌ Apenas administradores podem ver a lista de monitorados.", ephemeral=True)
+        return
+        
+    monitorados = db_get(f"server_config/{guild_id}/monitorados", [])
+    if not monitorados:
+        await interaction.response.send_message("🛡️ Nenhum usuário está sendo monitorado neste servidor atualmente.", ephemeral=True)
+        return
+        
+    lista = [f"• `{uid}` (<@{uid}>)" for uid in monitorados]
+    embed = discord.Embed(title="🛡️ IDs Sob Monitoramento de Segurança", description="\n".join(lista), color=discord.Color.red())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --- EVENTO DE SEGURANÇA ATIVA: ON_MEMBER_UPDATE ---
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    """Detecta se um membro monitorado recebeu permissões administrativas, removendo o cargo dele e de quem o promoveu."""
+    guild_id = str(after.guild.id)
+    
+    # Busca a lista de IDs sob monitoramento no servidor
+    monitorados = db_get(f"server_config/{guild_id}/monitorados", [])
+    
+    # Limpa possíveis chaves nulas e verifica se o ID atual está sendo monitorado
+    if not monitorados or str(after.id) not in [str(uid) for uid in monitorados if uid]:
+        return
+        
+    # Verifica se antes o membro possuía permissões perigosas
+    antes_adm = False
+    for r in before.roles:
+        if r.permissions.manage_roles or r.permissions.manage_channels or r.permissions.administrator:
+            antes_adm = True
+            break
+            
+    # Verifica se agora ele possui e qual foi o cargo responsável por isso
+    agora_adm = False
+    cargo_adicionado = None
+    for r in after.roles:
+        if r not in before.roles:
+            if r.permissions.manage_roles or r.permissions.manage_channels or r.permissions.administrator:
+                agora_adm = True
+                cargo_adicionado = r
+                break
+                
+    # Caso de Ativação do Antiraid: O usuário monitorado recebeu um cargo perigoso
+    if not antes_adm and agora_adm and cargo_adicionado:
+        print(f"[ANTIRAID] Alerta! Usuário monitorado {after.name} ({after.id}) recebeu o cargo perigoso: {cargo_adicionado.name}")
+        
+        # 1. Tira imediatamente o cargo do usuário recebido (after)
+        try:
+            await after.remove_roles(cargo_adicionado, reason="[ANTIRAID] Usuário sob monitoramento recebeu cargo de segurança!")
+        except discord.Forbidden:
+            print(f"[ANTIRAID] Falha de permissão ao tentar remover cargo do usuário monitorado {after.name}")
+
+        # 2. Busca nos Logs de Auditoria do Discord quem realizou a promoção
+        quem_promoveu = None
+        try:
+            async for entry in after.guild.audit_logs(limit=5, action=discord.AuditLogAction.member_role_update):
+                if entry.target.id == after.id:
+                    quem_promoveu = entry.user
+                    break
+        except Exception as e:
+            print(f"[ANTIRAID] Falha ao ler logs de auditoria para encontrar quem deu o cargo: {e}")
+            
+        # 3. Se identificarmos quem deu o cargo, removemos todos os cargos administrativos dele (se possível)
+        if quem_promoveu and isinstance(quem_promoveu, discord.Member):
+            print(f"[ANTIRAID] Responsável identificado: {quem_promoveu.name} ({quem_promoveu.id})")
+            
+            try:
+                for r_promotor in list(quem_promoveu.roles):
+                    if r_promotor.permissions.manage_roles or r_promotor.permissions.manage_channels or r_promotor.permissions.administrator:
+                        # Ignora o default_role (@everyone) que não pode ser removido
+                        if r_promotor != after.guild.default_role:
+                            try:
+                                await quem_promoveu.remove_roles(r_promotor, reason="[ANTIRAID] Atribuiu cargo administrativo a um usuário monitorado!")
+                            except discord.Forbidden:
+                                pass
+            except Exception as e:
+                print(f"[ANTIRAID] Erro ao punir o promotor {quem_promoveu.name}: {e}")
+
+        # 4. Envia o alerta no canal de sistema do servidor
+        canal_alerta = after.guild.system_channel
+        if not canal_alerta:
+            # Se não houver system_channel, manda no primeiro canal onde o bot puder enviar mensagens
+            for ch in after.guild.text_channels:
+                if ch.permissions_for(after.guild.me).send_messages:
+                    canal_alerta = ch
+                    break
+                    
+        if canal_alerta:
+            embed = discord.Embed(
+                title="🚨 INCIDENTE DE SEGURANÇA DETECTADO (ANTIRAID) 🚨",
+                description=f"O usuário monitorado {after.mention} recebeu um cargo com permissões perigosas!",
+                color=discord.Color.red()
+            )
+            embed.add_field(name="Membro Alvo", value=f"{after.mention} (Cargo `{cargo_adicionado.name}` Removido)", inline=True)
+            if quem_promoveu:
+                embed.add_field(name="Responsável Punido", value=f"{quem_promoveu.mention} (Cargos Administrativos Removidos)", inline=True)
+            else:
+                embed.add_field(name="Responsável", value="Não foi possível mapear nos logs a tempo", inline=True)
+            await canal_alerta.send(embed=embed)
+
+
+# --- COMANDO EXCLUSIVO: PAINEL ADMINISTRATIVO MASTER ---
+
+@bot.command(name="painel-adm")
+async def painel_adm_prefix(ctx: commands.Context):
+    """Abre o painel interativo de administração master (Apenas para o dono do bot)."""
+    if ctx.author.id != DONO_BOT_ID:
+        await ctx.send("❌ **Acesso negado!** Apenas o dono do bot pode utilizar o painel administrativo.")
+        return
+        
+    embed = discord.Embed(
+        title="⚙️ Painel de Controle - Administração Master",
+        description="Selecione uma das opções nos botões abaixo para gerenciar a nuvem e o status do bot:",
+        color=discord.Color.dark_red()
+    )
+    view = PainelAdminView(bot, ctx.author.id)
+    await ctx.send(embed=embed, view=view)
+
+@bot.tree.command(name="painel-adm", description="Abre o painel interativo de administração master (Apenas para o dono do bot).")
+async def painel_adm_slash(interaction: discord.Interaction):
+    """Abre o painel de forma efêmera (privada) para o dono."""
+    if interaction.user.id != DONO_BOT_ID:
+        await interaction.response.send_message("❌ **Acesso negado!** Apenas o dono do bot pode usar este painel.", ephemeral=True)
+        return
+        
+    embed = discord.Embed(
+        title="⚙️ Painel de Controle - Administração Master",
+        description="Selecione uma das opções nos botões abaixo para gerenciar a nuvem e o status do bot:",
+        color=discord.Color.dark_red()
+    )
+    view = PainelAdminView(bot, interaction.user.id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+# --- INTERCEPTORES DE EVENTO PARA MÉTRICAS E AUTO-ROLE ---
 
 @bot.before_invoke
 async def monitorar_comandos_prefixo(ctx: commands.Context):
@@ -1328,9 +1707,32 @@ async def monitorar_comandos_prefixo(ctx: commands.Context):
 
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
-    """Registra uma atividade de comando sempre que uma interação (/ ou botões) for ativada."""
+    """Registra estatísticas e intercepta de forma global cliques em botões persistentes de cargos."""
     if interaction.type == discord.InteractionType.application_command:
         registrar_execucao_comando()
+        
+    # Intercepta cliques de botões de cargos persistentes (role_ROLE_ID) [1]
+    elif interaction.type == discord.InteractionType.component:
+        custom_id = interaction.data.get("custom_id", "")
+        if custom_id.startswith("role_"):
+            role_id = int(custom_id.split("_")[1])
+            guild = interaction.guild
+            member = interaction.user
+            role = guild.get_role(role_id) if guild else None
+            
+            if role:
+                if role in member.roles:
+                    try:
+                        await member.remove_roles(role)
+                        await interaction.response.send_message(f"✅ O cargo **{role.name}** foi removido de você!", ephemeral=True)
+                    except discord.Forbidden:
+                        await interaction.response.send_message("❌ Eu não tenho permissão hierárquica para remover este cargo de você. Coloque meu cargo acima dele na lista do Discord!", ephemeral=True)
+                else:
+                    try:
+                        await member.add_roles(role)
+                        await interaction.response.send_message(f"✅ O cargo **{role.name}** foi adicionado a você!", ephemeral=True)
+                    except discord.Forbidden:
+                        await interaction.response.send_message("❌ Eu não tenho permissão hierárquica para adicionar este cargo a você. Coloque meu cargo acima dele na lista do Discord!", ephemeral=True)
 
 
 # --- COMANDOS: CENTRAL DE AJUDA (HELP / AJUDA) ---
@@ -1359,7 +1761,7 @@ def criar_embed_ajuda() -> discord.Embed:
     embed.add_field(
         name="📋 Ficha de Servidores (Incremental)",
         value="`#registrar-servidor [@membro] [valores...]` ou `/registrar-servidor`\n"
-              "• Registra fichas customizadas. Cada salvamento recebe uma **ID sequencial única** no servidor e salva quem é o proprietário (`owner`) por seu ID interno do bot.",
+              "• Registra fichas customizadas. Cada salvamento recebe uma **ID sequencial única** no servidor e grava quem o registrou (`owner`) por seu ID interno do bot.",
         inline=False
     )
     embed.add_field(
@@ -1369,11 +1771,17 @@ def criar_embed_ajuda() -> discord.Embed:
         inline=False
     )
     embed.add_field(
-        name="🔌 Testes de Conexão (GitHub Gist DB)",
-        value="`#io-write <texto>` / `/io-write <texto>`\n"
-              "• Grava uma mensagem de teste em tempo real na nuvem.\n"
-              "`#io-read` / `/io-read`\n"
-              "• Lê a última mensagem de teste salva diretamente do Gist do GitHub.",
+        name="📋 Respostas Rápidas (FAQ - Novo)",
+        value="`#faq <chave>` ou `/faq`\n"
+              "• Exibe ou gerencia (adiciona/remove) atalhos e links rápidos gravados na nuvem do Gist.",
+        inline=False
+    )
+    embed.add_field(
+        name="🛡️ Escudo de Segurança (Antiraid - Novo)",
+        value="`#monitorar <id>` ou `/monitorar`\n"
+              "• Adiciona um ID à lista de vigilância. Se ele receber cargos administrativos, o cargo será tirado dele e de quem o promoveu.\n"
+              "`#desmonitorar <id>` / `#monitorados`\n"
+              "• Gerencia e lista os IDs vigiados no servidor.",
         inline=False
     )
     embed.add_field(
