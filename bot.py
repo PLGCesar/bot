@@ -9,7 +9,18 @@ import asyncio
 import time
 import requests
 import io
+import logging
+from collections import defaultdict
 from PIL import Image, ImageDraw, ImageFont
+
+# --- CONFIGURAÇÃO DE LOGGING (Console apenas - Render free) ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[logging.StreamHandler()]  # Só console, sem arquivo
+)
+logger = logging.getLogger(__name__)
 
 # --- VARIÁVEIS DE AMBIENTE (Puxadas do Render ou Termux) ---
 TOKEN = os.environ.get('DISCORD_TOKEN')
@@ -32,15 +43,33 @@ app = Flask(__name__)
 SENHA_ADMIN_FILE = "senha_admin.txt"
 COMANDOS_TMP_FILE = "comandos_hora.tmp"
 
+# --- RATE LIMITING SIMPLES (prevenção de abuso) ---
+_request_times = defaultdict(list)
+_rate_limit_window = 60  # janela de 60 segundos
+_rate_limit_max = 30  # máximo de 30 requisições por janela
+
+def check_rate_limit(ip: str) -> bool:
+    """Verifica se um IP excedeu o rate limit. Retorna True se OK, False se bloqueado."""
+    now = time.time()
+    # Remove requisições antigas (fora da janela)
+    _request_times[ip] = [t for t in _request_times[ip] if now - t < _rate_limit_window]
+    # Verifica limite
+    if len(_request_times[ip]) >= _rate_limit_max:
+        return False
+    _request_times[ip].append(now)
+    return True
+
 
 # --- ENGENHARIA DE BANCO DE DADOS EM NUVEM (GITHUB GIST DB) ---
 
 # Cache local para evitar requisições desnecessárias (evita rate-limit do GitHub)
 _local_cache = {}
+_last_gist_sync = 0  # Timestamp do último sync com GitHub
+_gist_sync_interval = 30  # Sincronizar no máximo a cada 30 segundos
 
 def sincronizar_banco_local():
     """Baixa todo o banco de dados do Gist do GitHub e sincroniza com o cache local no startup."""
-    global _local_cache
+    global _local_cache, _last_gist_sync
     if GITHUB_TOKEN and GIST_ID:
         headers = {
             "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -55,24 +84,35 @@ def sincronizar_banco_local():
                 file_data = data.get("files", {}).get("database.json", {})
                 content = file_data.get("content", "{}")
                 _local_cache = json.loads(content)
+                _last_gist_sync = time.time()
                 
                 # Salva backup local
                 with open("local_db.json", "w", encoding="utf-8") as f:
                     json.dump(_local_cache, f, indent=4, ensure_ascii=False)
-                print("[Gist DB] Banco de dados em nuvem sincronizado com sucesso!")
+                logger.info("Banco de dados em nuvem sincronizado com sucesso!")
                 return
             else:
-                print(f"[Gist DB] Status {resp.status_code} ao tentar carregar Gist no boot.")
+                logger.warning(f"Status {resp.status_code} ao carregar Gist no boot.")
+        except requests.exceptions.Timeout:
+            logger.error("Timeout ao conectar ao GitHub Gist (5s).")
+        except requests.exceptions.ConnectionError:
+            logger.error("Erro de conexão ao GitHub Gist.")
+        except json.JSONDecodeError:
+            logger.error("Erro ao fazer parse do JSON do Gist.")
         except Exception as e:
-            print(f"[Gist DB] Falha ao conectar ao GitHub Gist: {e}")
+            logger.error(f"Falha ao conectar ao GitHub Gist: {e}")
             
     # Fallback local se o Gist não estiver configurado
     if os.path.exists("local_db.json"):
         try:
             with open("local_db.json", "r", encoding="utf-8") as f:
                 _local_cache = json.load(f)
-            print("[Gist DB] Utilizando backup local_db.json.")
-        except Exception:
+            logger.info("Utilizando backup local_db.json.")
+        except json.JSONDecodeError:
+            logger.error("Erro ao fazer parse do backup local_db.json.")
+            _local_cache = {}
+        except Exception as e:
+            logger.error(f"Erro ao ler local_db.json: {e}")
             _local_cache = {}
 
 def db_get(path: str, default=None):
@@ -87,8 +127,8 @@ def db_get(path: str, default=None):
         return default
 
 def db_set(path: str, value) -> bool:
-    """Atualiza o cache local, salva o backup em disco e envia as alterações para o GitHub Gist."""
-    global _local_cache
+    """Atualiza o cache local, salva o backup em disco e envia as alterações para o GitHub Gist (com throttling)."""
+    global _local_cache, _last_gist_sync
     keys = path.strip("/").split("/")
     temp = _local_cache
     for k in keys[:-1]:
@@ -101,11 +141,19 @@ def db_set(path: str, value) -> bool:
     try:
         with open("local_db.json", "w", encoding="utf-8") as f:
             json.dump(_local_cache, f, indent=4, ensure_ascii=False)
+    except IOError as e:
+        logger.error(f"Erro ao escrever local_db.json: {e}")
+        return False
     except Exception as e:
-        print(f"[Erro Escrita Local] {e}")
+        logger.error(f"Erro inesperado ao escrever local_db.json: {e}")
+        return False
         
-    # Sincroniza com a nuvem do GitHub Gist se configurado
+    # Sincroniza com a nuvem do GitHub Gist se configurado (com throttling)
     if GITHUB_TOKEN and GIST_ID:
+        # Evita enviar para GitHub a cada mudança (throttle de 30s)
+        if time.time() - _last_gist_sync < _gist_sync_interval:
+            return True  # Retorna True pois local já foi salvo
+        
         headers = {
             "Authorization": f"Bearer {GITHUB_TOKEN}",
             "Accept": "application/vnd.github+json",
@@ -122,18 +170,82 @@ def db_set(path: str, value) -> bool:
         }
         try:
             resp = requests.patch(url, headers=headers, json=payload, timeout=5)
+            _last_gist_sync = time.time()
             if resp.status_code == 200:
-                print("[Gist DB] Alterações enviadas com sucesso para a nuvem!")
+                logger.info("Alterações sincronizadas com GitHub Gist.")
                 return True
             else:
-                print(f"[Erro Gist DB] Status {resp.status_code} ao enviar PATCH para o GitHub.")
+                logger.warning(f"Status {resp.status_code} ao fazer PATCH no GitHub.")
+                return False
+        except requests.exceptions.Timeout:
+            logger.warning("Timeout ao sincronizar com GitHub (5s). Dados salvos localmente.")
+            return True  # Local foi salvo, retry posterior
+        except requests.exceptions.ConnectionError:
+            logger.warning("Erro de conexão ao GitHub. Dados salvos localmente.")
+            return True  # Local foi salvo, retry posterior
         except Exception as e:
-            print(f"[Erro Gist DB] Falha ao enviar modificações: {e}")
+            logger.error(f"Erro ao sincronizar com GitHub: {e}")
+            return True  # Local foi salvo, retry posterior
             
     return not (GITHUB_TOKEN and GIST_ID)
 
 
-# --- MÓDULO DE BANCO DE DADOS DE USUÁRIOS (REGISTRO DINÂMICO) ---
+# --- SISTEMA DE TEMAS PARA PERFIL (Feature 18) ---
+
+TEMAS_DISPONIVEIS = {
+    "dark": {
+        "nome": "🌙 Dark",
+        "fundo": "#1a1a1a",
+        "texto_principal": "#ffffff",
+        "texto_secundario": "#b0b0b0",
+        "caixa_bio": (20, 20, 20, 130)
+    },
+    "light": {
+        "nome": "☀️ Light",
+        "fundo": "#f5f5f5",
+        "texto_principal": "#1a1a1a",
+        "texto_secundario": "#4a4a4a",
+        "caixa_bio": (240, 240, 240, 180)
+    },
+    "neon": {
+        "nome": "⚡ Neon",
+        "fundo": "#0d0221",
+        "texto_principal": "#ff006e",
+        "texto_secundario": "#8338ec",
+        "caixa_bio": (16, 2, 45, 140)
+    },
+    "ocean": {
+        "nome": "🌊 Ocean",
+        "fundo": "#0a1128",
+        "texto_principal": "#00d9ff",
+        "texto_secundario": "#0099cc",
+        "caixa_bio": (5, 20, 60, 130)
+    },
+    "sunset": {
+        "nome": "🌅 Sunset",
+        "fundo": "#ff6b35",
+        "texto_principal": "#fff8f0",
+        "texto_secundario": "#ffd700",
+        "caixa_bio": (255, 100, 20, 140)
+    },
+    "forest": {
+        "nome": "🌲 Forest",
+        "fundo": "#1b4332",
+        "texto_principal": "#95d5b2",
+        "texto_secundario": "#52b788",
+        "caixa_bio": (20, 40, 25, 130)
+    }
+}
+
+def obter_tema(user_data: dict, nome_tema: str = None):
+    """Retorna as cores do tema. Se não existir ou for inválido, usa Dark."""
+    if nome_tema is None:
+        nome_tema = user_data.get("tema", "dark")
+    
+    if nome_tema not in TEMAS_DISPONIVEIS:
+        nome_tema = "dark"
+    
+    return TEMAS_DISPONIVEIS[nome_tema]
 
 def obter_registro(discord_id: int) -> dict:
     """Busca as informações de um usuário com base no ID do Discord."""
@@ -159,6 +271,7 @@ def obter_ou_auto_registrar(user: discord.User, guild_id: str = "DirectMessage")
         "guild_id": guild_id,
         "bot_id": bot_id,
         "nome": user.display_name,
+        "tema": "dark",  # Tema padrão
         "perfil": {
             "fundo": "#2f3136",
             "fundo_url": "",
@@ -167,7 +280,7 @@ def obter_ou_auto_registrar(user: discord.User, guild_id: str = "DirectMessage")
         }
     }
     db_set(f"users/{user_id}", novo_cadastro)
-    print(f"[Auto-Registro] Usuário {user.name} cadastrado com ID interno #{bot_id}!")
+    logger.info(f"Auto-Registro: Usuário {user.name} ({user_id}) registrado com ID interno #{bot_id}.")
     return novo_cadastro
 
 
@@ -182,8 +295,10 @@ def salvar_senha_admin(senha: str) -> bool:
     try:
         with open(SENHA_ADMIN_FILE, "w", encoding="utf-8") as f:
             f.write(senha.strip())
-    except Exception:
-        pass
+    except IOError as e:
+        logger.warning(f"Não foi possível salvar senha_admin.txt: {e}")
+    except Exception as e:
+        logger.error(f"Erro inesperado ao salvar senha_admin.txt: {e}")
     return db_set("admin_config/password", senha.strip())
 
 def existe_senha_admin() -> bool:
@@ -193,72 +308,99 @@ def existe_senha_admin() -> bool:
 
 # --- MÓDULO DE RENDEREZAÇÃO DO CARTÃO DE PERFIL (PILLOW) ---
 
-def gerar_imagem_perfil(nome: str, bot_id: int, avatar_url: str, pos: str, descricao: str, fundo_cor: str, fundo_url: str = None) -> io.BytesIO:
-    """Desenha dinamicamente o cartão de perfil em 600x300px com avatares redondos posicionáveis."""
+def gerar_imagem_perfil(nome: str, bot_id: int, avatar_url: str, pos: str, descricao: str, fundo_cor: str, fundo_url: str = None, tema: dict = None) -> io.BytesIO:
+    """Desenha dinamicamente o cartão de perfil com suporte a temas."""
+    if tema is None:
+        tema = TEMAS_DISPONIVEIS["dark"]
+    
     W, H = 600, 300
     
-    # 1. Carrega plano de fundo
+    # Carrega plano de fundo (URL tem prioridade)
     if fundo_url:
         try:
             resp = requests.get(fundo_url, timeout=3)
             img_fundo = Image.open(io.BytesIO(resp.content)).convert("RGBA")
             img_fundo = img_fundo.resize((W, H))
-        except Exception:
+        except requests.exceptions.RequestException:
             img_fundo = Image.new("RGBA", (W, H), fundo_cor)
     else:
-        try:
-            img_fundo = Image.new("RGBA", (W, H), fundo_cor)
-        except Exception:
-            img_fundo = Image.new("RGBA", (W, H), "#2f3136")
+        img_fundo = Image.new("RGBA", (W, H), fundo_cor)
             
     draw = ImageDraw.Draw(img_fundo)
     
-    # 2. Caixa semi-transparente para dar contraste ao texto de biografia
-    draw.rectangle([20, 200, 580, 280], fill=(0, 0, 0, 110))
+    # Caixa semi-transparente para contraste do texto (usa cor do tema)
+    caixa_cor = tema.get("caixa_bio", (0, 0, 0, 110))
+    draw.rectangle([20, 200, 580, 280], fill=caixa_cor)
     
-    # 3. Carrega e posiciona o avatar redondo do Discord (Forçado em PNG)
+    # Carrega e posiciona avatar (redondo)
     avatar_size = 120
     try:
         resp_av = requests.get(avatar_url, timeout=3)
         img_avatar = Image.open(io.BytesIO(resp_av.content)).convert("RGBA")
         img_avatar = img_avatar.resize((avatar_size, avatar_size))
         
-        # Cria máscara circular perfeita para o avatar
+        # Cria máscara circular
         mascara = Image.new("L", (avatar_size, avatar_size), 0)
         draw_mascara = ImageDraw.Draw(mascara)
         draw_mascara.ellipse((0, 0, avatar_size, avatar_size), fill=255)
         
-        # Coordenadas do canto com margem (padding)
+        # Posicionamento com padding
         pad = 20
-        if pos in ["superior_esquerdo", "se"]:
-            coords = (pad, pad)
-        elif pos in ["superior_direito", "sd"]:
-            coords = (W - avatar_size - pad, pad)
-        elif pos in ["inferior_esquerdo", "ie"]:
-            coords = (pad, H - avatar_size - pad)
-        elif pos in ["inferior_direito", "id"]:
-            coords = (W - avatar_size - pad, H - avatar_size - pad)
-        else:
-            coords = (pad, pad)
-            
+        posicoes = {
+            "superior_esquerdo": (pad, pad),
+            "se": (pad, pad),
+            "superior_direito": (W - avatar_size - pad, pad),
+            "sd": (W - avatar_size - pad, pad),
+            "inferior_esquerdo": (pad, H - avatar_size - pad),
+            "ie": (pad, H - avatar_size - pad),
+            "inferior_direito": (W - avatar_size - pad, H - avatar_size - pad),
+            "id": (W - avatar_size - pad, H - avatar_size - pad),
+            "centro": ((W - avatar_size) // 2, (H - avatar_size) // 2),
+            "c": ((W - avatar_size) // 2, (H - avatar_size) // 2)
+        }
+        coords = posicoes.get(pos, (pad, pad))
         img_fundo.paste(img_avatar, coords, mascara)
-    except Exception as e:
-        print(f"[Pillow] Falha ao renderizar avatar redondo: {e}")
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Não consegui baixar avatar: {e}")
         
-    # 4. Escrita de Textos com Fontes do Sistema (Fallback de segurança)
-    fonte = None
+    # Texto com fontes do sistema (com fallback)
+    fonte_nome = None
+    fonte_desc = None
     try:
         font_paths = [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
             "arial.ttf",
             "C:\\Windows\\Fonts\\arial.ttf"
         ]
         for path in font_paths:
             if os.path.exists(path):
-                fonte = ImageFont.truetype(path, 18)
+                fonte_nome = ImageFont.truetype(path, 20)
+                fonte_desc = ImageFont.truetype(path, 14)
                 break
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Não consegui carregar fonte: {e}")
+    
+    # Cores do tema
+    cor_nome = tema.get("texto_principal", "#ffffff")
+    cor_desc = tema.get("texto_secundario", "#b0b0b0")
+    
+    # Desenha nome e ID
+    text_nome = f"{nome} (#{bot_id})"
+    draw.text((220, 50), text_nome, fill=cor_nome, font=fonte_nome)
+    
+    # Desenha descrição com quebra de linha
+    linhas_desc = [descricao[i:i+45] for i in range(0, len(descricao), 45)]
+    y_desc = 210
+    for linha in linhas_desc[:2]:  # Máximo 2 linhas
+        draw.text((40, y_desc), linha, fill=cor_desc, font=fonte_desc)
+        y_desc += 25
+    
+    # Retorna em BytesIO
+    buffer = io.BytesIO()
+    img_fundo.convert("RGB").save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
         
     # Se nenhuma fonte de sistema for achada, carrega a bitmap padrão para não quebrar a compilação
     if fonte is None:
@@ -309,7 +451,7 @@ def registrar_execucao_comando():
         with open(COMANDOS_TMP_FILE, "w", encoding="utf-8") as f:
             json.dump(dados, f, indent=4)
     except Exception as e:
-        print(f"[Erro Métricas] Falha ao gravar comandos_hora.tmp: {e}")
+        logger.error(f"Falha ao gravar comandos_hora.tmp: {e}")
 
 def obter_metricas_comandos() -> tuple:
     """Retorna a quantidade acumulada e a média de comandos por hora (Quantidade / 2)."""
@@ -344,6 +486,12 @@ def index():
 
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
+    # Rate limiting
+    client_ip = request.remote_addr
+    if not check_rate_limit(client_ip):
+        logger.warning(f"Rate limit excedido para IP {client_ip}")
+        return "⚠️ Muitas requisições. Tente novamente em alguns minutos.", 429
+    
     # Caso 1: Primeiro acesso
     if not existe_senha_admin():
         if request.method == "POST":
@@ -1059,42 +1207,39 @@ async def registrar_config_slash(
 # 1. COMANDO #perfil / /perfil
 @bot.command(name="perfil")
 async def perfil_prefix(ctx: commands.Context):
-    """Gera e exibe a imagem personalizada do perfil do usuário."""
-    # Garante o auto-registro no primeiro comando usado
+    """Gera e exibe seu cartão de perfil personalizado."""
     user_data = obter_ou_auto_registrar(ctx.author, str(ctx.guild.id) if ctx.guild else "DirectMessage")
     
     bot_id = user_data["bot_id"]
     nome = user_data["nome"]
     perfil = user_data.get("perfil", {})
+    tema = obter_tema(user_data)
     
     fundo_cor = perfil.get("fundo", "#2f3136")
     fundo_url = perfil.get("fundo_url", "")
     pos = perfil.get("avatar_pos", "superior_esquerdo")
-    descricao = perfil.get("descricao", "Nenhuma biografia definida.")
+    descricao = perfil.get("descricao", "Nenhuma biografia definida ainda. Use #perfil-config para personalizar!")
     
-    # Força a URL do avatar do Discord a ser PNG para suporte total do Pillow no Linux
     avatar_url = ctx.author.display_avatar.with_format("png").url
 
-    # Exibe animação de digitação
     async with ctx.typing():
         try:
             loop = asyncio.get_running_loop()
-            # Roda o gerador do Pillow em um Executor em segundo plano para não travar o loop de eventos
             buffer = await loop.run_in_executor(
-                None, gerar_imagem_perfil, nome, bot_id, avatar_url, pos, descricao, fundo_cor, fundo_url
+                None, gerar_imagem_perfil, nome, bot_id, avatar_url, pos, descricao, fundo_cor, fundo_url, tema
             )
             file = discord.File(fp=buffer, filename="perfil.png")
             await ctx.send(file=file)
         except Exception as e:
-            # Fallback de segurança em modo Embed Rich
+            logger.error(f"Erro ao gerar perfil: {e}")
             embed = discord.Embed(
-                title=f"👤 Perfil de {nome} (Slot #{bot_id})",
+                title=f"👤 {nome} (ID: #{bot_id})",
                 description=descricao,
                 color=discord.Color.blue()
             )
-            embed.add_field(name="Posição do Avatar", value=f"`{pos}`", inline=True)
-            embed.add_field(name="Cor do Fundo", value=f"`{fundo_cor}`", inline=True)
-            await ctx.send(content=f"⚠️ Falha de renderização local ({e}). Exibindo formato alternativo:", embed=embed)
+            embed.add_field(name="📍 Posição Avatar", value=f"`{pos}`", inline=True)
+            embed.add_field(name="🎨 Tema", value=f"`{user_data.get('tema', 'dark')}`", inline=True)
+            await ctx.send("Não consegui renderizar como imagem, mas aqui está em outro formato:", embed=embed)
 
 @bot.tree.command(name="perfil", description="Exibe o seu cartão de perfil personalizado em formato de imagem.")
 async def perfil_slash(interaction: discord.Interaction):
@@ -1107,31 +1252,78 @@ async def perfil_slash(interaction: discord.Interaction):
     bot_id = user_data["bot_id"]
     nome = user_data["nome"]
     perfil = user_data.get("perfil", {})
+    tema = obter_tema(user_data)
     
     fundo_cor = perfil.get("fundo", "#2f3136")
     fundo_url = perfil.get("fundo_url", "")
     pos = perfil.get("avatar_pos", "superior_esquerdo")
-    descricao = perfil.get("descricao", "Nenhuma biografia definida.")
+    descricao = perfil.get("descricao", "Nenhuma biografia definida ainda. Use /perfil-config para personalizar!")
     
-    # Força a URL do avatar do Discord a ser PNG para suporte total do Pillow no Linux
     avatar_url = interaction.user.display_avatar.with_format("png").url
 
     try:
         loop = asyncio.get_running_loop()
         buffer = await loop.run_in_executor(
-            None, gerar_imagem_perfil, nome, bot_id, avatar_url, pos, descricao, fundo_cor, fundo_url
+            None, gerar_imagem_perfil, nome, bot_id, avatar_url, pos, descricao, fundo_cor, fundo_url, tema
         )
         file = discord.File(fp=buffer, filename="perfil.png")
         await interaction.followup.send(file=file, ephemeral=True)
     except Exception as e:
+        logger.error(f"Erro ao gerar perfil slash: {e}")
         embed = discord.Embed(
-            title=f"👤 Perfil de {nome} (Slot #{bot_id})",
+            title=f"👤 {nome} (ID: #{bot_id})",
             description=descricao,
             color=discord.Color.blue()
         )
-        embed.add_field(name="Posição do Avatar", value=f"`{pos}`", inline=True)
-        embed.add_field(name="Cor do Fundo", value=f"`{fundo_cor}`", inline=True)
-        await interaction.followup.send(content=f"⚠️ Falha de renderização local ({e}). Exibindo formato alternativo:", embed=embed, ephemeral=True)
+        embed.add_field(name="📍 Posição Avatar", value=f"`{pos}`", inline=True)
+        embed.add_field(name="🎨 Tema", value=f"`{user_data.get('tema', 'dark')}`", inline=True)
+        await interaction.followup.send("Não consegui renderizar como imagem, mas aqui está:", embed=embed, ephemeral=True)
+
+
+# 1.5 COMANDO #perfil-tema / /perfil-tema (Novo - Sistema de Temas)
+@bot.command(name="perfil-tema")
+async def perfil_tema_prefix(ctx: commands.Context, tema: str = None):
+    """Muda o tema visual do seu perfil."""
+    if tema is None:
+        lista_temas = "\n".join([f"• `{nome}` - {info['nome']}" for nome, info in TEMAS_DISPONIVEIS.items()])
+        embed = discord.Embed(
+            title="🎨 Temas Disponíveis",
+            description=f"Use `#perfil-tema [nome]` para mudar\n\n{lista_temas}",
+            color=discord.Color.purple()
+        )
+        await ctx.send(embed=embed)
+        return
+    
+    if tema not in TEMAS_DISPONIVEIS:
+        await ctx.send(f"❌ Tema `{tema}` não existe. Use `#perfil-tema` para ver opções.")
+        return
+    
+    user_data = obter_ou_auto_registrar(ctx.author, str(ctx.guild.id) if ctx.guild else "DirectMessage")
+    db_set(f"users/{ctx.author.id}/tema", tema)
+    
+    await ctx.send(f"✅ Tema alterado para `{TEMAS_DISPONIVEIS[tema]['nome']}`!")
+
+@bot.tree.command(name="perfil-tema", description="Muda o tema visual do seu perfil.")
+async def perfil_tema_slash(interaction: discord.Interaction, tema: str = None):
+    """Versão slash do comando de tema."""
+    if tema is None:
+        lista_temas = "\n".join([f"• `{nome}` - {info['nome']}" for nome, info in TEMAS_DISPONIVEIS.items()])
+        embed = discord.Embed(
+            title="🎨 Temas Disponíveis",
+            description=f"Escolha um tema\n\n{lista_temas}",
+            color=discord.Color.purple()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
+    if tema not in TEMAS_DISPONIVEIS:
+        await interaction.response.send_message(f"❌ Tema `{tema}` não existe.", ephemeral=True)
+        return
+    
+    user_data = obter_ou_auto_registrar(interaction.user, str(interaction.guild.id) if interaction.guild else "DirectMessage")
+    db_set(f"users/{interaction.user.id}/tema", tema)
+    
+    await interaction.response.send_message(f"✅ Tema alterado para `{TEMAS_DISPONIVEIS[tema]['nome']}`!", ephemeral=True)
 
 
 # 2. COMANDO #perfil-config / /perfil-config
@@ -1631,13 +1823,13 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                 
     # Caso de Ativação do Antiraid: O usuário monitorado recebeu um cargo perigoso
     if not antes_adm and agora_adm and cargo_adicionado:
-        print(f"[ANTIRAID] Alerta! Usuário monitorado {after.name} ({after.id}) recebeu o cargo perigoso: {cargo_adicionado.name}")
+        logger.warning(f"ANTIRAID: Usuário monitorado {after.name} ({after.id}) recebeu o cargo: {cargo_adicionado.name}")
         
         # 1. Tira imediatamente o cargo do usuário recebido (after)
         try:
             await after.remove_roles(cargo_adicionado, reason="[ANTIRAID] Usuário sob monitoramento recebeu cargo de segurança!")
         except discord.Forbidden:
-            print(f"[ANTIRAID] Falha de permissão ao tentar remover cargo do usuário monitorado {after.name}")
+            logger.error(f"ANTIRAID: Falha de permissão ao remover cargo de {after.name}")
 
         # 2. Busca nos Logs de Auditoria do Discord quem realizou a promoção
         quem_promoveu = None
@@ -1647,11 +1839,11 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     quem_promoveu = entry.user
                     break
         except Exception as e:
-            print(f"[ANTIRAID] Falha ao ler logs de auditoria para encontrar quem deu o cargo: {e}")
+            logger.error(f"ANTIRAID: Falha ao ler logs de auditoria: {e}")
             
         # 3. Se identificarmos quem deu o cargo, removemos todos os cargos administrativos dele (se possível)
         if quem_promoveu and isinstance(quem_promoveu, discord.Member):
-            print(f"[ANTIRAID] Responsável identificado: {quem_promoveu.name} ({quem_promoveu.id})")
+            logger.info(f"ANTIRAID: Responsável identificado: {quem_promoveu.name} ({quem_promoveu.id})")
             
             try:
                 for r_promotor in list(quem_promoveu.roles):
@@ -1663,7 +1855,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                             except discord.Forbidden:
                                 pass
             except Exception as e:
-                print(f"[ANTIRAID] Erro ao punir o promotor {quem_promoveu.name}: {e}")
+                logger.error(f"ANTIRAID: Erro ao punir promotor {quem_promoveu.name}: {e}")
 
         # 4. Envia o alerta no canal de sistema do servidor
         canal_alerta = after.guild.system_channel
@@ -1843,16 +2035,16 @@ async def ajuda_slash(interaction: discord.Interaction):
 
 @bot.event
 async def on_ready():
-    print(f"Bot do Discord conectado com sucesso como {bot.user}")
+    logger.info(f"Bot conectado como {bot.user}")
     
     # Sincroniza o banco de dados do GitHub Gist com a memória RAM e backup local
     sincronizar_banco_local()
     
     try:
         synced = await bot.tree.sync()
-        print(f"Sincronizados {len(synced)} comandos de barra.")
+        logger.info(f"Sincronizados {len(synced)} comandos de barra.")
     except Exception as e:
-        print(f"Erro ao sincronizar comandos de barra: {e}")
+        logger.error(f"Erro ao sincronizar comandos de barra: {e}")
 
 
 # --- INICIALIZADOR DO FLASK ---
@@ -1873,15 +2065,13 @@ if __name__ == "__main__":
     
     # Validação de segurança do Token do Discord
     if not TOKEN:
-        print("\n" + "="*60)
-        print("❌ ERRO: A variável de ambiente 'DISCORD_TOKEN' não foi encontrada!")
-        print("\n• Se estiver rodando no Termux, use: export DISCORD_TOKEN='seu_token'")
-        print("• Se estiver rodando no Render, adicione 'DISCORD_TOKEN' na aba Environment Variables.")
-        print("="*60 + "\n")
+        logger.critical("DISCORD_TOKEN não foi encontrada nas variáveis de ambiente!")
+        logger.info("Termux: export DISCORD_TOKEN='seu_token'")
+        logger.info("Render: Adicione DISCORD_TOKEN na aba Environment Variables.")
     else:
         try:
             bot.run(TOKEN)
         except discord.errors.LoginFailure:
-            print("Erro: O Token do bot fornecido na variável de ambiente é inválido.")
+            logger.critical("Token do Discord inválido ou expirado.")
         except Exception as e:
-            print(f"Erro ao iniciar o bot: {e}")
+            logger.critical(f"Erro crítico ao iniciar o bot: {e}")
