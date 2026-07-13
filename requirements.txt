@@ -2,3 +2,5 @@ Pillow
 discord
 flask
 requests
+PyNaCl
+davey
