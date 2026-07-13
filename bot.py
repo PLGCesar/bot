@@ -2061,7 +2061,7 @@ async def on_ready():
 
 def rodar_servidor_web():
     """Inicializa o servidor Flask associado à porta dinâmica do Render."""
-    app.secret_key = "scn_bot_reimagined_master_key_123"
+    app.secret_key = os.environ.get('KEYSC')
     porta = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=porta, debug=False, use_reloader=False)
 
