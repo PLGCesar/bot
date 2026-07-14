@@ -10,15 +10,6 @@ SENHA_ADMIN_FILE = "senha_admin.txt"
 
 _local_cache = {}
 
-TEMAS_DISPONIVEIS = {
-    "dark": {"nome": "🌙 Dark", "fundo": "#1a1a1a", "texto_principal": "#ffffff", "texto_secundario": "#b0b0b0", "caixa_bio": (20, 20, 20, 130)},
-    "light": {"nome": "☀️ Light", "fundo": "#f5f5f5", "texto_principal": "#1a1a1a", "texto_secundario": "#4a4a4a", "caixa_bio": (240, 240, 240, 180)},
-    "neon": {"nome": "⚡ Neon", "fundo": "#0d0221", "texto_principal": "#ff006e", "texto_secundario": "#8338ec", "caixa_bio": (16, 2, 45, 140)},
-    "ocean": {"nome": "🌊 Ocean", "fundo": "#0a1128", "texto_principal": "#00d9ff", "texto_secundario": "#0099cc", "caixa_bio": (5, 20, 60, 130)},
-    "sunset": {"nome": "🌅 Sunset", "fundo": "#ff6b35", "texto_principal": "#fff8f0", "texto_secundario": "#ffd700", "caixa_bio": (255, 100, 20, 140)},
-    "forest": {"nome": "🌲 Forest", "fundo": "#1b4332", "texto_principal": "#95d5b2", "texto_secundario": "#52b788", "caixa_bio": (20, 40, 25, 130)}
-}
-
 def sincronizar_banco_local():
     global _local_cache
     if GITHUB_TOKEN and GIST_ID:
@@ -65,22 +56,6 @@ def db_set(path: str, value) -> bool:
             return resp.status_code == 200
         except Exception as e: logger.error(f"Erro PATCH Gist: {e}"); return True
     return True
-
-def obter_registro(discord_id: int): return db_get(f"users/{discord_id}")
-
-def obter_ou_auto_registrar(user, guild_id="DM"):
-    user_id = str(user.id)
-    d = db_get(f"users/{user_id}")
-    if d: return d
-    bot_id = 0 if user.id == DONO_BOT_ID else db_get("global_config/proximo_bot_id", 1)
-    if bot_id > 0: db_set("global_config/proximo_bot_id", bot_id + 1)
-    data = {"discord_id": user_id, "guild_id": guild_id, "bot_id": bot_id, "nome": user.display_name, "tema": "dark", "perfil": {"fundo": "#2f3136", "fundo_url": "", "avatar_pos": "se", "descricao": "Use #perfil-config para mudar!"}}
-    db_set(f"users/{user_id}", data)
-    return data
-
-def obter_tema(user_data: dict, nome_tema=None):
-    t = nome_tema or user_data.get("tema", "dark")
-    return TEMAS_DISPONIVEIS.get(t, TEMAS_DISPONIVEIS["dark"])
 
 def obter_senha_admin(): return db_get("admin_config/password", "")
 

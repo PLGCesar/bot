@@ -1,6 +1,5 @@
-import os, json, time, requests, io, discord, random
-from PIL import Image, ImageDraw, ImageFont
-from database import db_get, db_set, logger, TEMAS_DISPONIVEIS, obter_tema
+import os, json, time, requests, discord, random
+from database import db_get, db_set, logger
 
 COMANDOS_TMP_FILE = "comandos_hora.tmp"
 from collections import defaultdict
@@ -20,41 +19,6 @@ def rolar_dado_viciado(lados: int) -> int:
         minimo_alto = max(1, int(lados * 0.6))
         return random.randint(minimo_alto, lados)
     return random.randint(1, lados)
-
-def gerar_imagem_perfil(nome: str, bot_id: int, avatar_url: str, pos: str, descricao: str, fundo_cor: str, fundo_url=None, tema=None) -> io.BytesIO:
-    tema = tema or TEMAS_DISPONIVEIS["dark"]
-    W, H = 600, 300
-    if fundo_url:
-        try: resp = requests.get(fundo_url, timeout=3); img_fundo = Image.open(io.BytesIO(resp.content)).convert("RGBA").resize((W, H))
-        except Exception: img_fundo = Image.new("RGBA", (W, H), fundo_cor)
-    else:
-        try: img_fundo = Image.new("RGBA", (W, H), fundo_cor)
-        except Exception: img_fundo = Image.new("RGBA", (W, H), "#2f3136")
-    draw = ImageDraw.Draw(img_fundo)
-    draw.rectangle([20, 200, 580, 280], fill=tema.get("caixa_bio", (0,0,0,110)))
-    sz = 120
-    try:
-        resp_av = requests.get(avatar_url, timeout=3); av = Image.open(io.BytesIO(resp_av.content)).convert("RGBA").resize((sz, sz))
-        mask = Image.new("L", (sz, sz), 0); ImageDraw.Draw(mask).ellipse((0, 0, sz, sz), fill=255)
-        p = 20
-        posicoes = {"superior_esquerdo": (p, p), "se": (p, p), "superior_direito": (W-sz-p, p), "sd": (W-sz-p, p), "inferior_esquerdo": (p, H-sz-p), "ie": (p, H-sz-p), "inferior_direito": (W-sz-p, H-sz-p), "id": (W-sz-p, H-sz-p)}
-        img_fundo.paste(av, posicoes.get(pos, (p, p)), mask)
-    except Exception as e: print(f"Erro avatar: {e}")
-    f_n = f_d = None
-    try:
-        paths = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "arial.ttf", "C:\\Windows\\Fonts\\arial.ttf"]
-        for path in paths:
-            if os.path.exists(path): f_n = ImageFont.truetype(path, 18); f_d = ImageFont.truetype(path, 14); break
-    except Exception: pass
-    f_n = f_n or ImageFont.load_default(); f_d = f_d or ImageFont.load_default()
-    x = 160 if pos in ["se", "ie", "superior_esquerdo", "inferior_esquerdo"] else 40
-    y = 40 if pos in ["se", "sd", "superior_esquerdo", "superior_direito"] else 120
-    draw.text((x, y), nome, fill=tema.get("texto_principal", "#fff"), font=f_n)
-    draw.text((x, y + 30), f"ID: #{bot_id}", fill="#5865F2", font=f_n)
-    lines = [descricao[i:i+55] for i in range(0, len(descricao), 55)]
-    curr_y = 210
-    for l in lines[:3]: draw.text((30, curr_y), l, fill=tema.get("texto_secundario", "#b0b0b0"), font=f_d); curr_y += 22
-    buf = io.BytesIO(); img_fundo.convert("RGB").save(buf, format="PNG"); buf.seek(0); return buf
 
 def registrar_execucao_comando():
     agora = time.time(); d = {"timestamp_inicial": agora, "quantidade": 0}

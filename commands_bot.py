@@ -3,8 +3,8 @@ from discord.ext import commands
 from discord import app_commands
 import asyncio, os
 
-from database import DONO_BOT_ID, db_get, db_set, obter_registro, obter_ou_auto_registrar, obter_senha_admin, logger, TEMAS_DISPONIVEIS, obter_tema
-from utils import check_rate_limit, gerar_imagem_perfil, registrar_execucao_comando, obter_metricas_comandos, deserializar_permissoes_canal, extrair_estrutura_completa_servidor, rolar_dado_viciado
+from database import DONO_BOT_ID, db_get, db_set, obter_senha_admin, logger
+from utils import check_rate_limit, registrar_execucao_comando, obter_metricas_comandos, deserializar_permissoes_canal, extrair_estrutura_completa_servidor, rolar_dado_viciado
 
 async def reconstruir_servidor_completo(guild: discord.Guild, data: dict, canal_logs: discord.TextChannel):
     roles_data = data.get("roles", []); categories_data = data.get("categories", []); channels_data = data.get("channels", []); role_map = {}
@@ -49,8 +49,8 @@ class PainelAdminView(discord.ui.View):
         return True
     @discord.ui.button(label="Status do Sistema", style=discord.ButtonStyle.primary, emoji="🖥️")
     async def status_button(self, inter, button):
-        lat = f"{self.bot.latency * 1000:.0f}ms" if self.bot.is_ready() else "N/A"; usr = len(db_get("users", {})); nxt = db_get("global_config/proximo_bot_id", 1)
-        embed = discord.Embed(title="🖥️ Status Detalhado", color=discord.Color.blue()).add_field(name="Ping", value=f"`{lat}`").add_field(name="Guildas", value=f"`{len(self.bot.guilds)}`").add_field(name="Registros", value=f"`{usr}`").add_field(name="Próximo ID", value=f"`#{nxt}`")
+        lat = f"{self.bot.latency * 1000:.0f}ms" if self.bot.is_ready() else "N/A"
+        embed = discord.Embed(title="🖥️ Status Detalhado", color=discord.Color.blue()).add_field(name="Ping", value=f"`{lat}`").add_field(name="Guildas", value=f"`{len(self.bot.guilds)}`")
         await inter.response.send_message(embed=embed, ephemeral=True)
     @discord.ui.button(label="Forçar Sync Gist", style=discord.ButtonStyle.secondary, emoji="🔄")
     async def sync_gist_button(self, inter, button):
@@ -68,14 +68,44 @@ class PainelAdminView(discord.ui.View):
         await inter.response.defer(ephemeral=True)
         try: synced = await self.bot.tree.sync(); await inter.followup.send(f"✅ Sincronizados `{len(synced)}` slashes.", ephemeral=True)
         except Exception as e: await inter.followup.send(f"❌ Erro sync: {e}", ephemeral=True)
-    @discord.ui.button(label="Ver Registros", style=discord.ButtonStyle.primary, emoji="👥")
-    async def ver_registros_button(self, inter, button):
-        db = db_get("users", {})
-        if not db or not isinstance(db, dict): await inter.response.send_message("🔍 Sem registros.", ephemeral=True); return
-        lista = [f"• ID Bot: `#{v.get('bot_id', '?')}` | `{v.get('nome', 'Desconhecido')}` (Discord: <@{d}>)" for d, v in db.items()]
-        txt = "\n".join(lista[:15])
-        if len(lista) > 15: txt += f"\n*... e outros {len(lista) - 15} registros.*"
-        await inter.response.send_message(embed=discord.Embed(title="👥 Usuários Cadastrados", description=txt, color=discord.Color.green()), ephemeral=True)
+
+class NotaEditModal(discord.ui.Modal):
+    def __init__(self, view_parent):
+        super().__init__(title="✏️ Editar Bloco de Notas")
+        self.view_parent = view_parent
+        self.texto_input = discord.ui.TextInput(
+            label="Escreva seu texto (Máx 4000 caracteres)",
+            style=discord.TextStyle.long,
+            default=self.view_parent.active_text[:4000],
+            max_length=4000,
+            required=True
+        )
+        self.add_item(self.texto_input)
+
+    async def on_submit(self, inter: discord.Interaction):
+        self.view_parent.active_text = self.texto_input.value
+        self.view_parent.alterado = True
+        embed = discord.Embed(title=f"📝 Bloco de Notas Pessoal (Slot {self.view_parent.slot})", description=self.view_parent.active_text, color=discord.Color.green())
+        embed.set_footer(text="Atenção: Clique em Salvar para enviar para a nuvem!")
+        await inter.response.edit_message(embed=embed, view=self.view_parent)
+
+class NotaView(discord.ui.View):
+    def __init__(self, bot_inst, user_id: int, slot: int, initial_text: str):
+        super().__init__(timeout=900); self.bot = bot_inst; self.user_id = user_id; self.slot = slot; self.active_text = initial_text; self.alterado = False
+    async def on_timeout(self):
+        if self.alterado: db_set(f"notes/{self.user_id}/{self.slot}", self.active_text)
+    @discord.ui.button(label="Editar", style=discord.ButtonStyle.primary, emoji="✍️")
+    async def editar_button(self, inter, button): await inter.response.send_modal(NotaEditModal(self))
+    @discord.ui.button(label="Salvar", style=discord.ButtonStyle.success, emoji="💾")
+    async def salvar_button(self, inter, button):
+        db_set(f"notes/{self.user_id}/{self.slot}", self.active_text); self.alterado = False
+        await inter.response.send_message("💾 **Sua nota foi gravada e salva com sucesso na nuvem!**", ephemeral=True)
+    @discord.ui.button(label="Sair (salva auto)", style=discord.ButtonStyle.danger, emoji="🚪")
+    async def sair_button(self, inter, button):
+        db_set(f"notes/{self.user_id}/{self.slot}", self.active_text)
+        for item in self.children: item.disabled = True
+        embed = discord.Embed(title="🚪 Sessão Finalizada", description="Sessão de edição encerrada. Suas notas estão seguras na nuvem!", color=discord.Color.red())
+        await inter.response.edit_message(embed=embed, view=None); self.stop()
 
 class BotCommands(commands.Cog):
     def __init__(self, bot_inst): self.bot = bot_inst
@@ -103,127 +133,6 @@ class BotCommands(commands.Cog):
         t = db_get("teste/mensagem")
         if t: await inter.response.send_message(f"📖 Lido:\n`{t}`", ephemeral=True)
         else: await inter.response.send_message("🔍 Vazio.", ephemeral=True)
-    @commands.command(name="registrar")
-    async def registrar_prefix(self, ctx):
-        u = obter_ou_auto_registrar(ctx.author, str(ctx.guild.id) if ctx.guild else "DM")
-        await ctx.send(f"🎉 Registrado! ID: `#{u['bot_id']}`")
-    @app_commands.command(name="registrar", description="Registra seu usuário globalmente no banco de dados do bot.")
-    async def registrar_slash(self, inter):
-        u = obter_ou_auto_registrar(inter.user, str(inter.guild.id) if inter.guild else "DM")
-        await inter.response.send_message(f"🎉 Registrado! ID: `#{u['bot_id']}`", ephemeral=True)
-    @commands.command(name="registrar-servidor")
-    async def registrar_servidor_prefix(self, ctx, m: discord.Member = None, *, r: str = None):
-        if not ctx.guild or not m: await ctx.send("❌ Erro. Uso: `#registrar-servidor @membro [nomes]`"); return
-        g_id = str(ctx.guild.id); cfg = db_get(f"server_config/{g_id}", {})
-        if not (ctx.author.id == DONO_BOT_ID or ctx.author.id == ctx.guild.owner_id or ctx.author.guild_permissions.administrator or cfg.get("permissao_registrar_servidor", True)):
-            await ctx.send("❌ Sem permissão."); return
-        r_id = cfg.get("proximo_registro_id", 1); cfg["proximo_registro_id"] = r_id + 1; db_set(f"server_config/{g_id}", cfg)
-        lbls = cfg.get("labels", {"0":"Nome","1":"Nome1","2":"Nome2","3":"Nome3","4":"Nome4","5":"Nome5"})
-        nomes = r.split() if r else []
-        while len(nomes) < 6: nomes.append("Não Definido")
-        nomes = nomes[:6]
-        db_set(f"server_registrations/{g_id}/{m.id}", {"id": r_id, "owner": obter_ou_auto_registrar(ctx.author, g_id)["bot_id"], "server_id": g_id, "owner_id": ctx.guild.owner_id, "registered_user_id": str(m.id), "nome": nomes[0], "nome1": nomes[1], "nome2": nomes[2], "nome3": nomes[3], "nome4": nomes[4], "nome5": nomes[5]})
-        embed = discord.Embed(title=f"📋 Ficha (ID: #{r_id})!", description=f"Membro {m.mention} registrado.", color=discord.Color.blue())
-        for k, v in lbls.items(): embed.add_field(name=v, value=f"`{nomes[int(k)]}`", inline=True)
-        await ctx.send(embed=embed)
-    @app_commands.command(name="registrar-servidor", description="Cria uma ficha de registro personalizada para um membro no servidor.")
-    @app_commands.describe(membro="Membro", nome="Campo 0", nome1="Campo 1", nome2="Campo 2", nome3="Campo 3", nome4="Campo 4", nome5="Campo 5")
-    async def registrar_servidor_slash(self, inter, membro: discord.Member, nome: str, nome1: str="Não Definido", nome2: str="Não Definido", nome3: str="Não Definido", nome4: str="Não Definido", nome5: str="Não Definido"):
-        if not inter.guild: await inter.response.send_message("❌ Apenas em guilda.", ephemeral=True); return
-        g_id = str(inter.guild.id); cfg = db_get(f"server_config/{g_id}", {})
-        if not (inter.user.id == DONO_BOT_ID or inter.user.id == inter.guild.owner_id or inter.user.guild_permissions.administrator or cfg.get("permissao_registrar_servidor", True)):
-            await inter.response.send_message("❌ Sem permissão.", ephemeral=True); return
-        r_id = cfg.get("proximo_registro_id", 1); cfg["proximo_registro_id"] = r_id + 1; db_set(f"server_config/{g_id}", cfg)
-        lbls = cfg.get("labels", {"0":"Nome","1":"Nome1","2":"Nome2","3":"Nome3","4":"Nome4","5":"Nome5"})
-        db_set(f"server_registrations/{g_id}/{membro.id}", {"id": r_id, "owner": obter_ou_auto_registrar(inter.user, g_id)["bot_id"], "server_id": g_id, "owner_id": inter.guild.owner_id, "registered_user_id": str(membro.id), "nome": nome, "nome1": nome1, "nome2": nome2, "nome3": nome3, "nome4": nome4, "nome5": nome5})
-        embed = discord.Embed(title=f"📋 Ficha (ID: #{r_id})!", description=f"Membro {membro.mention} registrado.", color=discord.Color.blue())
-        for k, v in lbls.items(): embed.add_field(name=v, value=f"`{locals()['nome' + k if k != '0' else 'nome']}`", inline=True)
-        await inter.response.send_message(embed=embed)
-    @commands.command(name="registrar-config")
-    async def registrar_config_prefix(self, ctx, sub_comando: str = None, *args):
-        if not ctx.guild: await ctx.send("❌ Apenas em guilda."); return
-        if not (ctx.author.id == DONO_BOT_ID or ctx.author.id == ctx.guild.owner_id or ctx.author.guild_permissions.administrator):
-            await ctx.send("❌ Sem permissão."); return
-        if not sub_comando: await ctx.send("• `#registrar-config <True/False>`\n• `#registrar-config label <0-5> <Novo Nome>`"); return
-        g_id = str(ctx.guild.id); cfg = db_get(f"server_config/{g_id}", {})
-        if sub_comando.lower() in ["true", "false", "sim", "nao", "não", "ativo", "ativado", "desativado", "inativo"]:
-            cfg["permissao_registrar_servidor"] = sub_comando.lower() in ["true", "sim", "ativo", "ativado"]
-            db_set(f"server_config/{g_id}", cfg)
-            await ctx.send(f"✅ Permissão geral atualizada para `{cfg['permissao_registrar_servidor']}`.")
-        elif sub_comando.lower() == "label":
-            if len(args) < 2 or not args[0].isdigit() or int(args[0]) < 0 or int(args[0]) > 5:
-                await ctx.send("❌ Formato: `#registrar-config label [0-5] [Nome]`"); return
-            lbls = cfg.get("labels", {})
-            lbls[args[0]] = " ".join(args[1:])
-            cfg["labels"] = lbls
-            db_set(f"server_config/{g_id}", cfg)
-            await ctx.send(f"✅ Rótulo do Campo {args[0]} alterado para: `{lbls[args[0]]}`.")
-    @app_commands.command(name="registrar-config", description="Altera as configurações de registro e customiza os campos do servidor.")
-    @app_commands.describe(permissao="True/False", campo_index="Campo 0-5", campo_nome="Novo nome do rótulo")
-    async def registrar_config_slash(self, inter, permissao: bool = None, campo_index: int = None, campo_nome: str = None):
-        if not inter.guild: await inter.response.send_message("❌ Apenas em guilda.", ephemeral=True); return
-        if not (inter.user.id == DONO_BOT_ID or inter.user.id == inter.guild.owner_id or inter.user.guild_permissions.administrator):
-            await inter.response.send_message("❌ Sem permissão.", ephemeral=True); return
-        g_id = str(inter.guild.id); cfg = db_get(f"server_config/{g_id}", {})
-        if permissao is not None: cfg["permissao_registrar_servidor"] = permissao
-        if campo_index is not None and campo_nome is not None:
-            if campo_index < 0 or campo_index > 5: await inter.response.send_message("❌ Índice inválido.", ephemeral=True); return
-            lbls = cfg.get("labels", {})
-            lbls[str(campo_index)] = campo_nome
-            cfg["labels"] = lbls
-        db_set(f"server_config/{g_id}", cfg)
-        await inter.response.send_message("✅ Configurações atualizadas!", ephemeral=True)
-    @commands.command(name="perfil")
-    async def perfil_prefix(self, ctx):
-        u = obter_ou_auto_registrar(ctx.author, str(ctx.guild.id) if ctx.guild else "DM"); t = obter_tema(u)
-        async with ctx.typing():
-            try:
-                buf = await asyncio.get_running_loop().run_in_executor(None, gerar_imagem_perfil, u["nome"], u["bot_id"], ctx.author.display_avatar.with_format("png").url, u["perfil"]["avatar_pos"], u["perfil"]["descricao"], u["perfil"]["fundo"], u["perfil"]["fundo_url"], t)
-                await ctx.send(file=discord.File(fp=buf, filename="perfil.png"))
-            except Exception: await ctx.send("Incapaz de desenhar perfil.", embed=discord.Embed(title=f"👤 {u['nome']} (#{u['bot_id']})", description=u["perfil"]["descricao"], color=discord.Color.blue()))
-    @app_commands.command(name="perfil", description="Exibe o seu cartão de perfil personalizado em formato de imagem.")
-    async def perfil_slash(self, inter):
-        await inter.response.defer(ephemeral=True); g_id = str(inter.guild.id) if inter.guild else "DM"
-        u = obter_ou_auto_registrar(inter.user, g_id); t = obter_tema(u)
-        try:
-            buf = await asyncio.get_running_loop().run_in_executor(None, gerar_imagem_perfil, u["nome"], u["bot_id"], inter.user.display_avatar.with_format("png").url, u["perfil"]["avatar_pos"], u["perfil"]["descricao"], u["perfil"]["fundo"], u["perfil"]["fundo_url"], t)
-            await inter.followup.send(file=discord.File(fp=buf, filename="perfil.png"), ephemeral=True)
-        except Exception: await inter.followup.send(embed=discord.Embed(title=f"👤 {u['nome']} (#{u['bot_id']})", description=u["perfil"]["descricao"], color=discord.Color.blue()), ephemeral=True)
-    @commands.command(name="perfil-tema")
-    async def perfil_tema_prefix(self, ctx, tema: str = None):
-        if not tema: await ctx.send("🎨 Temas: `" + "`, `".join(TEMAS_DISPONIVEIS.keys()) + "`\nUse `#perfil-tema [nome]`."); return
-        if tema not in TEMAS_DISPONIVEIS: await ctx.send("❌ Tema inválido."); return
-        obter_ou_auto_registrar(ctx.author); db_set(f"users/{ctx.author.id}/tema", tema)
-        await ctx.send(f"✅ Tema definido para `{TEMAS_DISPONIVEIS[tema]['nome']}`.")
-    @app_commands.command(name="perfil-tema", description="Muda o tema visual do seu perfil.")
-    async def perfil_tema_slash(self, inter, tema: str = None):
-        if not tema: await inter.response.send_message("🎨 Temas: `" + "`, `".join(TEMAS_DISPONIVEIS.keys()) + "`", ephemeral=True); return
-        if tema not in TEMAS_DISPONIVEIS: await inter.response.send_message("❌ Inválido.", ephemeral=True); return
-        obter_ou_auto_registrar(inter.user); db_set(f"users/{inter.user.id}/tema", tema)
-        await inter.response.send_message(f"✅ Tema definido para `{TEMAS_DISPONIVEIS[tema]['nome']}`!", ephemeral=True)
-    @commands.command(name="perfil-config")
-    async def perfil_config_prefix(self, ctx, opcao: str = None, *, valor: str = None):
-        u = obter_ou_auto_registrar(ctx.author); p = u["perfil"]
-        if not opcao or not valor: await ctx.send("• `#perfil-config fundo <#Hex>`\n• `#perfil-config fundo_url <link>`\n• `#perfil-config posicao <se|sd|ie|id>`\n• `#perfil-config descricao <texto>`"); return
-        opcao = opcao.lower().strip()
-        if opcao == "fundo": p["fundo"] = valor
-        elif opcao == "fundo_url": p["fundo_url"] = valor
-        elif opcao == "posicao":
-            pmap = {"se":"superior_esquerdo","sd":"superior_direito","ie":"inferior_esquerdo","id":"inferior_direito"}
-            p["avatar_pos"] = pmap.get(valor.lower().strip(), "superior_esquerdo")
-        elif opcao in ["descricao", "desc"]: p["descricao"] = valor
-        db_set(f"users/{ctx.author.id}/perfil", p); await ctx.send("✅ Perfil atualizado!")
-    @app_commands.command(name="perfil-config", description="Personaliza os aspectos visuais e a biografia do seu cartão de perfil.")
-    @app_commands.describe(fundo="Hex", fundo_url="Link", posicao="se, sd, ie, id", descricao="Sua biografia")
-    async def perfil_config_slash(self, inter, fundo: str = None, fundo_url: str = None, posicao: str = None, descricao: str = None):
-        u = obter_ou_auto_registrar(inter.user); p = u["perfil"]
-        if fundo: p["fundo"] = fundo
-        if fundo_url: p["fundo_url"] = fundo_url
-        if posicao:
-            pmap = {"se":"superior_esquerdo","sd":"superior_direito","ie":"inferior_esquerdo","id":"inferior_direito"}
-            p["avatar_pos"] = pmap.get(posicao.lower().strip(), "superior_esquerdo")
-        if descricao: p["descricao"] = descricao
-        db_set(f"users/{inter.user.id}/perfil", p); await inter.response.send_message("✅ Perfil atualizado!", ephemeral=True)
     @commands.command(name="senha-adm")
     async def senha_adm_prefix(self, ctx):
         if ctx.author.id != DONO_BOT_ID: await ctx.send("❌ Apenas desenvolvedor master."); return
@@ -253,7 +162,6 @@ class BotCommands(commands.Cog):
         if not ctx.guild: await ctx.send("❌ Apenas em guilda."); return
         if not (ctx.author.guild_permissions.administrator or ctx.author.id == ctx.guild.owner_id or ctx.author.id == DONO_BOT_ID):
             await ctx.send("❌ Sem permissão."); return
-        obter_ou_auto_registrar(ctx.author, str(ctx.guild.id))
         m = await ctx.send("⚙️ **Escaneando estrutura do servidor...**")
         try:
             d = extrair_estrutura_completa_servidor(ctx.guild); db_set(f"templates/{ctx.author.id}", d)
@@ -264,9 +172,9 @@ class BotCommands(commands.Cog):
     @app_commands.command(name="copiar", description="Varre e copia canais, cargos, categorias e permissões para o seu clipboard em nuvem.")
     async def copiar_slash(self, inter):
         if not inter.guild: await inter.response.send_message("❌ Apenas em guilda.", ephemeral=True); return
-        if not (interaction := inter).user.guild_permissions.administrator and interaction.user.id != interaction.guild.owner_id and interaction.user.id != DONO_BOT_ID:
+        if not inter.user.guild_permissions.administrator and inter.user.id != inter.guild.owner_id and inter.user.id != DONO_BOT_ID:
             await inter.response.send_message("❌ Sem permissão.", ephemeral=True); return
-        await inter.response.defer(ephemeral=True); obter_ou_auto_registrar(inter.user, str(inter.guild.id))
+        await inter.response.defer(ephemeral=True)
         try:
             d = extrair_estrutura_completa_servidor(inter.guild); db_set(f"templates/{inter.user.id}", d)
             embed = discord.Embed(title="✅ Copiado!", description="Estrutura guardada de forma segura na nuvem.", color=discord.Color.green())
@@ -289,7 +197,6 @@ class BotCommands(commands.Cog):
         await inter.response.send_message(embed=discord.Embed(title="⚠️ AVISO DE CLONAGEM ⚠️", description="Você criará cargos, canais e categorias salvos.\nDeseja iniciar?", color=discord.Color.orange()), view=ColarConfirmacaoView(self.bot, inter.user.id, d, inter.guild), ephemeral=True)
     @commands.command(name="monitorar")
     async def monitorar_prefix(self, ctx, user_id: str = None):
-        obter_ou_auto_registrar(ctx.author, str(ctx.guild.id) if ctx.guild else "DM")
         if not (ctx.author.guild_permissions.administrator or ctx.author.id == ctx.guild.owner_id or ctx.author.id == DONO_BOT_ID):
             await ctx.send("❌ Apenas administradores."); return
         if not user_id: await ctx.send("❌ Forneça o ID."); return
@@ -301,7 +208,7 @@ class BotCommands(commands.Cog):
     @app_commands.describe(user_id="O ID do Discord do usuário que deseja monitorar.")
     async def monitorar_slash(self, inter, user_id: str):
         if not inter.guild: await inter.response.send_message("❌ Apenas em guilda.", ephemeral=True); return
-        guild_id = str(inter.guild.id); obter_ou_auto_registrar(inter.user, guild_id)
+        guild_id = str(inter.guild.id)
         if not (inter.user.guild_permissions.administrator or inter.user.id == inter.guild.owner_id or inter.user.id == DONO_BOT_ID):
             await inter.response.send_message("❌ Apenas administradores.", ephemeral=True); return
         m = db_get(f"server_config/{guild_id}/monitorados", [])
@@ -310,7 +217,6 @@ class BotCommands(commands.Cog):
         await inter.response.send_message(f"🛡️ **ID `{user_id}` monitorado com sucesso!**", ephemeral=True)
     @commands.command(name="desmonitorar")
     async def desmonitorar_prefix(self, ctx, user_id: str = None):
-        obter_ou_auto_registrar(ctx.author, str(ctx.guild.id) if ctx.guild else "DM")
         if not (ctx.author.guild_permissions.administrator or ctx.author.id == ctx.guild.owner_id or ctx.author.id == DONO_BOT_ID):
             await ctx.send("❌ Apenas administradores."); return
         if not user_id: await ctx.send("❌ Forneça o ID."); return
@@ -322,7 +228,7 @@ class BotCommands(commands.Cog):
     @app_commands.describe(user_id="O ID do Discord do usuário que deseja remover.")
     async def desmonitorar_slash(self, inter, user_id: str):
         if not inter.guild: await inter.response.send_message("❌ Apenas em guilda.", ephemeral=True); return
-        guild_id = str(inter.guild.id); obter_ou_auto_registrar(inter.user, guild_id)
+        guild_id = str(inter.guild.id)
         if not (inter.user.guild_permissions.administrator or inter.user.id == inter.guild.owner_id or inter.user.id == DONO_BOT_ID):
             await inter.response.send_message("❌ Apenas administradores.", ephemeral=True); return
         m = db_get(f"server_config/{guild_id}/monitorados", [])
@@ -331,7 +237,6 @@ class BotCommands(commands.Cog):
         await inter.response.send_message(f"✅ ID `{user_id}` removido.", ephemeral=True)
     @commands.command(name="monitorados")
     async def monitorados_prefix(self, ctx):
-        obter_ou_auto_registrar(ctx.author, str(ctx.guild.id) if ctx.guild else "DM")
         if not (ctx.author.guild_permissions.administrator or ctx.author.id == ctx.guild.owner_id or ctx.author.id == DONO_BOT_ID):
             await ctx.send("❌ Apenas administradores."); return
         guild_id = str(ctx.guild.id); m = db_get(f"server_config/{guild_id}/monitorados", [])
@@ -340,9 +245,41 @@ class BotCommands(commands.Cog):
     @app_commands.command(name="monitorados", description="Lista todos os IDs sob monitoramento de segurança neste servidor.")
     async def monitorados_slash(self, inter):
         if not inter.guild: await inter.response.send_message("❌ Apenas em guilda.", ephemeral=True); return
-        guild_id = str(inter.guild.id); obter_ou_auto_registrar(inter.user, guild_id)
+        guild_id = str(inter.guild.id)
         if not (inter.user.guild_permissions.administrator or inter.user.id == interaction.guild.owner_id or inter.user.id == DONO_BOT_ID):
             await inter.response.send_message("❌ Apenas administradores.", ephemeral=True); return
         m = db_get(f"server_config/{guild_id}/monitorados", [])
         if not m: await inter.response.send_message("🛡️ Nenhum usuário monitorado.", ephemeral=True); return
         await inter.response.send_message(embed=discord.Embed(title="🛡️ IDs Sob Vigilância", description="\n".join([f"• `{uid}` (<@{uid}>)" for uid in m]), color=discord.Color.red()), ephemeral=True)
+
+    @app_commands.command(name="nota", description="Gerencia o seu bloco de notas pessoal e permanente na nuvem.")
+    @app_commands.describe(
+        slot="Número do slot de notas (Membros: 1-5, Dono do Bot: Infinitos!).",
+        texto="Texto opcional para salvar de forma direta no slot correspondente (Max 5000 car.)."
+    )
+    async def nota_slash(self, inter: discord.Interaction, slot: int, texto: str = None):
+        user_id = inter.user.id
+        is_owner = (user_id == DONO_BOT_ID)
+        if not is_owner:
+            if slot < 1 or slot > 5:
+                await inter.response.send_message("❌ **Acesso negado!** Como membro padrão, você possui acesso aos slots de **1 a 5**.", ephemeral=True)
+                return
+        else:
+            if slot < 1:
+                await inter.response.send_message("❌ **Número inválido!** Escolha um slot a partir do número 1.", ephemeral=True)
+                return
+
+        guild_id = str(inter.guild.id) if inter.guild else "DirectMessage"
+        if texto:
+            if len(texto) > 5000:
+                await inter.response.send_message("❌ **Limite de caracteres excedido!** O texto enviado possui mais do que os 5000 caracteres máximos permitidos.", ephemeral=True)
+                return
+            db_set(f"notes/{user_id}/{slot}", texto)
+            embed = discord.Embed(title="💾 Notas Salvas na Nuvem!", description=f"Suas anotações foram salvas diretamente no **Slot {slot}**!", color=discord.Color.green())
+            await inter.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        texto_salvo = db_get(f"notes/{user_id}/{slot}", "Seu bloco de notas está vazio! Clique em Editar para escrever alguma coisa.")
+        embed = discord.Embed(title=f"📝 Bloco de Notas Pessoal (Slot {slot})", description=texto_salvo, color=discord.Color.blue())
+        view = NotaView(self.bot, user_id, slot, texto_salvo)
+        await inter.response.send_message(embed=embed, view=view, ephemeral=True)
