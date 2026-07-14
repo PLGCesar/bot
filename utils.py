@@ -1,4 +1,4 @@
-import os, json, time, requests, io, discord
+import os, json, time, requests, io, discord, random
 from PIL import Image, ImageDraw, ImageFont
 from database import db_get, db_set, logger
 
@@ -12,6 +12,17 @@ def check_rate_limit(ip: str) -> bool:
     if len(_request_times[ip]) >= 30: return False
     _request_times[ip].append(now)
     return True
+
+def rolar_dado_viciado(lados: int) -> int:
+    """Rola um dado com viés oculto para números mais altos, mantendo chance de números baixos."""
+    if lados < 2:
+        lados = 6
+    chance = random.randint(1, 100)
+    if chance <= 75:  # 75% de chance de rolar alto (vício oculto)
+        minimo_alto = max(1, int(lados * 0.6))
+        return random.randint(minimo_alto, lados)
+    else:             # 25% de chance de rolar totalmente honesto
+        return random.randint(1, lados)
 
 TEMAS_DISPONIVEIS = {
     "dark": {"nome": "🌙 Dark", "fundo": "#1a1a1a", "texto_principal": "#ffffff", "texto_secundario": "#b0b0b0", "caixa_bio": (20, 20, 20, 130)},
@@ -109,5 +120,3 @@ def extrair_estrutura_completa_servidor(guild) -> dict:
     for ch in guild.channels:
         if isinstance(ch, discord.CategoryChannel): continue
         t = "text" if isinstance(ch, discord.TextChannel) else "voice" if isinstance(ch, discord.VoiceChannel) else None
-        if t: chans.append({"id": ch.id, "type": t, "name": ch.name, "category_id": ch.category.id if ch.category else None, "position": ch.position, "topic": getattr(ch, "topic", None), "overwrites": serializar_permissoes_canal(ch)})
-    return {"guild_name": guild.name, "roles": roles, "categories": cats, "channels": chans}
