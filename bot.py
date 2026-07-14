@@ -4,13 +4,11 @@ import threading
 import asyncio
 import os
 
-# Importações absolutas das ferramentas lógicas e do Cog de comandos ativos [3]
 from database import TOKEN, logger, sincronizar_banco_local
 from utils import registrar_execucao_comando, db_get
-from commands_bot import BotCommands, PainelAdminView
+from commands_bot import BotCommands
 from web import app, rodar_servidor_web, bot_ref
 
-# --- CONFIGURAÇÃO DO BOT DO DISCORD ---
 intents = discord.Intents.default()
 intents.message_content = True 
 intents.members = True
@@ -20,13 +18,12 @@ class MyBot(commands.Bot):
         super().__init__(command_prefix="#", intents=intents, help_command=None)
         
     async def setup_hook(self):
-        # Carrega o Cog de comandos de forma assíncrona antes de conectar (Padrão Oficial d.py v2)
         await self.add_cog(BotCommands(self))
 
 bot = MyBot()
 
 
-# --- INTERCEPTORES DE EVENTO (MÉTRICAS E AUTO-ROLE) ---
+# --- INTERCEPTORES DE EVENTO ---
 
 @bot.before_invoke
 async def monitorar_comandos_prefixo(ctx: commands.Context):
@@ -102,7 +99,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 async def on_ready():
     logger.info(f"Bot do Discord conectado com sucesso como {bot.user}")
     
-    # Injeta a referência ativa do bot dentro do módulo web (Flask) para evitar importação circular!
     import web
     web.bot_ref = bot
     
@@ -118,8 +114,13 @@ async def on_ready():
 
 # --- INICIALIZAÇÃO MULTI-THREADING ---
 
+def rodar_servidor_web():
+    """Inicializa o servidor Flask associado à porta dinâmica do Render."""
+    app.secret_key = "scn_bot_reimagined_master_key_123"
+    porta = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=porta, debug=False, use_reloader=False)
+
 if __name__ == "__main__":
-    # Dispara o Flask (módulo web) em segundo plano
     thread_web = threading.Thread(target=rodar_servidor_web, daemon=True)
     thread_web.start()
     

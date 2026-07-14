@@ -1,6 +1,6 @@
 import os, json, time, requests, io, discord, random
 from PIL import Image, ImageDraw, ImageFont
-from database import db_get, db_set, logger
+from database import db_get, db_set, logger, TEMAS_DISPONIVEIS, obter_tema
 
 COMANDOS_TMP_FILE = "comandos_hora.tmp"
 from collections import defaultdict
@@ -14,28 +14,12 @@ def check_rate_limit(ip: str) -> bool:
     return True
 
 def rolar_dado_viciado(lados: int) -> int:
-    """Rola um dado com viés oculto para números mais altos, mantendo chance de números baixos."""
-    if lados < 2:
-        lados = 6
+    if lados < 2: lados = 6
     chance = random.randint(1, 100)
-    if chance <= 75:  # 75% de chance de rolar alto (vício oculto)
+    if chance <= 75:
         minimo_alto = max(1, int(lados * 0.6))
         return random.randint(minimo_alto, lados)
-    else:             # 25% de chance de rolar totalmente honesto
-        return random.randint(1, lados)
-
-TEMAS_DISPONIVEIS = {
-    "dark": {"nome": "🌙 Dark", "fundo": "#1a1a1a", "texto_principal": "#ffffff", "texto_secundario": "#b0b0b0", "caixa_bio": (20, 20, 20, 130)},
-    "light": {"nome": "☀️ Light", "fundo": "#f5f5f5", "texto_principal": "#1a1a1a", "texto_secundario": "#4a4a4a", "caixa_bio": (240, 240, 240, 180)},
-    "neon": {"nome": "⚡ Neon", "fundo": "#0d0221", "texto_principal": "#ff006e", "texto_secundario": "#8338ec", "caixa_bio": (16, 2, 45, 140)},
-    "ocean": {"nome": "🌊 Ocean", "fundo": "#0a1128", "texto_principal": "#00d9ff", "texto_secundario": "#0099cc", "caixa_bio": (5, 20, 60, 130)},
-    "sunset": {"nome": "🌅 Sunset", "fundo": "#ff6b35", "texto_principal": "#fff8f0", "texto_secundario": "#ffd700", "caixa_bio": (255, 100, 20, 140)},
-    "forest": {"nome": "🌲 Forest", "fundo": "#1b4332", "texto_principal": "#95d5b2", "texto_secundario": "#52b788", "caixa_bio": (20, 40, 25, 130)}
-}
-
-def obter_tema(user_data: dict, nome_tema=None):
-    t = nome_tema or user_data.get("tema", "dark")
-    return TEMAS_DISPONIVEIS.get(t, TEMAS_DISPONIVEIS["dark"])
+    return random.randint(1, lados)
 
 def gerar_imagem_perfil(nome: str, bot_id: int, avatar_url: str, pos: str, descricao: str, fundo_cor: str, fundo_url=None, tema=None) -> io.BytesIO:
     tema = tema or TEMAS_DISPONIVEIS["dark"]
@@ -120,3 +104,5 @@ def extrair_estrutura_completa_servidor(guild) -> dict:
     for ch in guild.channels:
         if isinstance(ch, discord.CategoryChannel): continue
         t = "text" if isinstance(ch, discord.TextChannel) else "voice" if isinstance(ch, discord.VoiceChannel) else None
+        if t: chans.append({"id": ch.id, "type": t, "name": ch.name, "category_id": ch.category.id if ch.category else None, "position": ch.position, "topic": getattr(ch, "topic", None), "overwrites": serializar_permissoes_canal(ch)})
+    return {"guild_name": guild.name, "roles": roles, "categories": cats, "channels": chans}
