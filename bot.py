@@ -100,12 +100,8 @@ async def on_ready():
     except Exception as e:
         logger.error(f"Erro ao sincronizar comandos de barra: {e}")
 
-def rodar_servidor_web():
-    app.secret_key = "scn_bot_reimagined_master_key_123"
-    porta = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=porta, debug=False, use_reloader=False)
-
 if __name__ == "__main__":
+    from web import rodar_servidor_web
     thread_web = threading.Thread(target=rodar_servidor_web, daemon=True)
     thread_web.start()
     
