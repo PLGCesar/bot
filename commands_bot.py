@@ -1,10 +1,10 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import asyncio, os
+import asyncio, os, random
 
 from database import DONO_BOT_ID, db_get, db_set, obter_senha_admin, logger
-from utils import check_rate_limit, registrar_execucao_comando, obter_metricas_comandos, deserializar_permissoes_canal, extrair_estrutura_completa_servidor, rolar_dado_viciado
+from utils import check_rate_limit, registrar_execucao_comando, obter_metricas_comandos, deserializar_permissoes_canal, extrair_estrutura_completa_servidor
 
 async def reconstruir_servidor_completo(guild: discord.Guild, data: dict, canal_logs: discord.TextChannel):
     roles_data = data.get("roles", []); categories_data = data.get("categories", []); channels_data = data.get("channels", []); role_map = {}
@@ -26,18 +26,18 @@ async def reconstruir_servidor_completo(guild: discord.Guild, data: dict, canal_
             elif ch_info["type"] == "voice": await guild.create_voice_channel(name=ch_info["name"], category=cat, overwrites=ow, position=ch_info["position"], reason="[CLONER] canais")
             await asyncio.sleep(0.5)
         except Exception as e: logger.error(f"Erro canal {ch_info['name']}: {e}")
-    try: await canal_logs.send(embed=discord.Embed(title="✨ Reconstrução Concluída! ✨", color=discord.Color.green()))
+    try: await canal_logs.send(embed=discord.Embed(title="✨ Oba! Reconstrução Concluída com Sucesso! ✨", color=discord.Color.green()))
     except Exception: pass
 
 class ColarConfirmacaoView(discord.ui.View):
     def __init__(self, bot_inst, autor_id: int, template_dados: dict, guild_alvo):
         super().__init__(timeout=60); self.bot = bot_inst; self.autor_id = autor_id; self.template_dados = template_dados; self.guild_alvo = guild_alvo
     async def interaction_check(self, inter) -> bool:
-        if inter.user.id != self.autor_id: await inter.response.send_message("❌ Proibido.", ephemeral=True); return False
+        if inter.user.id != self.autor_id: await inter.response.send_message("❌ Desculpe, apenas o autor original do comando pode confirmar!", ephemeral=True); return False
         return True
     @discord.ui.button(label="Confirmar Reconstrução", style=discord.ButtonStyle.danger, emoji="⚠️")
     async def confirmar_button(self, inter, button):
-        await inter.response.send_message("⚙️ **Reconstrução iniciada de forma assíncrona!**", ephemeral=True)
+        await inter.response.send_message("⚙️ **Processando...** Reconstruindo toda a estrutura física em segundo plano de forma segura!", ephemeral=True)
         for item in self.children: item.disabled = True
         await inter.message.edit(view=self); asyncio.create_task(reconstruir_servidor_completo(self.guild_alvo, self.template_dados, inter.channel))
 
@@ -45,28 +45,28 @@ class PainelAdminView(discord.ui.View):
     def __init__(self, bot_inst, autor_id: int):
         super().__init__(timeout=180); self.bot = bot_inst; self.autor_id = autor_id
     async def interaction_check(self, inter) -> bool:
-        if inter.user.id != self.autor_id: await inter.response.send_message("❌ Acesso negado.", ephemeral=True); return False
+        if inter.user.id != self.autor_id: await inter.response.send_message("❌ Acesso restrito! Apenas o desenvolvedor master do bot pode gerenciar.", ephemeral=True); return False
         return True
     @discord.ui.button(label="Status do Sistema", style=discord.ButtonStyle.primary, emoji="🖥️")
     async def status_button(self, inter, button):
         lat = f"{self.bot.latency * 1000:.0f}ms" if self.bot.is_ready() else "N/A"
-        embed = discord.Embed(title="🖥️ Status Detalhado", color=discord.Color.blue()).add_field(name="Ping", value=f"`{lat}`").add_field(name="Guildas", value=f"`{len(self.bot.guilds)}`")
+        embed = discord.Embed(title="🖥️ Painel de Diagnóstico do Sistema", color=discord.Color.blue()).add_field(name="Ping de API", value=f"`{lat}`").add_field(name="Guildas Ativas", value=f"`{len(self.bot.guilds)}`")
         await inter.response.send_message(embed=embed, ephemeral=True)
     @discord.ui.button(label="Forçar Sync Gist", style=discord.ButtonStyle.secondary, emoji="🔄")
     async def sync_gist_button(self, inter, button):
         await inter.response.defer(ephemeral=True)
         try:
             from database import sincronizar_banco_local; sincronizar_banco_local()
-            await inter.followup.send("✅ **Sync concluído!**", ephemeral=True)
-        except Exception as e: await inter.followup.send(f"❌ Erro: {e}", ephemeral=True)
+            await inter.followup.send("✅ **Banco de dados sincronizado e atualizado com sucesso!**", ephemeral=True)
+        except Exception as e: await inter.followup.send(f"❌ Erro de sincronização: {e}", ephemeral=True)
     @discord.ui.button(label="Baixar Backup", style=discord.ButtonStyle.secondary, emoji="📁")
     async def backup_button(self, inter, button):
-        if os.path.exists("local_db.json"): await inter.response.send_message(content="📄 Backup cache:", file=discord.File("local_db.json"), ephemeral=True)
-        else: await inter.response.send_message("❌ Vazio.", ephemeral=True)
+        if os.path.exists("local_db.json"): await inter.response.send_message(content="📄 **Backup gerado!** Baixe o seu banco de dados atual:", file=discord.File("local_db.json"), ephemeral=True)
+        else: await inter.response.send_message("❌ Arquivo de backup `local_db.json` não localizado.", ephemeral=True)
     @discord.ui.button(label="Sincronizar Slash (/) ", style=discord.ButtonStyle.success, emoji="🔨")
     async def sync_slash_button(self, inter, button):
         await inter.response.defer(ephemeral=True)
-        try: synced = await self.bot.tree.sync(); await inter.followup.send(f"✅ Sincronizados `{len(synced)}` slashes.", ephemeral=True)
+        try: synced = await self.bot.tree.sync(); await inter.followup.send(f"✅ Maravilha! Sincronizados `{len(synced)}` comandos de barra.", ephemeral=True)
         except Exception as e: await inter.followup.send(f"❌ Erro sync: {e}", ephemeral=True)
 
 class NotaEditModal(discord.ui.Modal):
@@ -86,7 +86,7 @@ class NotaEditModal(discord.ui.Modal):
         self.view_parent.active_text = self.texto_input.value
         self.view_parent.alterado = True
         embed = discord.Embed(title=f"📝 Bloco de Notas Pessoal (Slot {self.view_parent.slot})", description=self.view_parent.active_text, color=discord.Color.green())
-        embed.set_footer(text="Atenção: Clique em Salvar para enviar para a nuvem!")
+        embed.set_footer(text="Atenção: Não se esqueça de clicar em Salvar para enviar para a nuvem!")
         await inter.response.edit_message(embed=embed, view=self.view_parent)
 
 class NotaView(discord.ui.View):
@@ -99,13 +99,45 @@ class NotaView(discord.ui.View):
     @discord.ui.button(label="Salvar", style=discord.ButtonStyle.success, emoji="💾")
     async def salvar_button(self, inter, button):
         db_set(f"notes/{self.user_id}/{self.slot}", self.active_text); self.alterado = False
-        await inter.response.send_message("💾 **Sua nota foi gravada e salva com sucesso na nuvem!**", ephemeral=True)
+        await inter.response.send_message("💾 **Suas notas foram salvas com sucesso na nuvem!**", ephemeral=True)
     @discord.ui.button(label="Sair (salva auto)", style=discord.ButtonStyle.danger, emoji="🚪")
     async def sair_button(self, inter, button):
         db_set(f"notes/{self.user_id}/{self.slot}", self.active_text)
         for item in self.children: item.disabled = True
         embed = discord.Embed(title="🚪 Sessão Finalizada", description="Sessão de edição encerrada. Suas notas estão seguras na nuvem!", color=discord.Color.red())
         await inter.response.edit_message(embed=embed, view=None); self.stop()
+
+
+class DadoButton(discord.ui.Button):
+    def __init__(self, label, num):
+        super().__init__(label=label, style=discord.ButtonStyle.secondary)
+        self.num = num
+
+    async def callback(self, inter: discord.Interaction):
+        v = self.view
+        if inter.user.id != v.autor_id:
+            await inter.response.send_message("❌ Apenas quem jogou o dado pode escolher o número secreto!", ephemeral=True)
+            return
+            
+        canal = inter.guild.get_channel(v.canal_id) if inter.guild else inter.channel
+        if not canal:
+            try: canal = await v.bot.fetch_channel(v.canal_id)
+            except Exception: canal = inter.channel
+            
+        await canal.send(f"🎲 | **{inter.user.mention}** rolou um dado de **{v.lados}** lados e tirou: **{self.num}**!")
+        await inter.response.edit_message(content="✅ **Rolagem enviada!** Evidências ocultadas com sucesso no chat privado.", embed=None, view=None)
+
+
+class DadoPickerView(discord.ui.View):
+    def __init__(self, bot_inst, autor_id: int, canal_id: int, lados: int):
+        super().__init__(timeout=60)
+        self.bot = bot_inst
+        self.autor_id = autor_id
+        self.canal_id = canal_id
+        self.lados = lados
+        for i in range(1, lados + 1):
+            self.add_item(DadoButton(label=str(i), num=i))
+
 
 class BotCommands(commands.Cog):
     def __init__(self, bot_inst): self.bot = bot_inst
@@ -172,7 +204,7 @@ class BotCommands(commands.Cog):
     @app_commands.command(name="copiar", description="Varre e copia canais, cargos, categorias e permissões para o seu clipboard em nuvem.")
     async def copiar_slash(self, inter):
         if not inter.guild: await inter.response.send_message("❌ Apenas em guilda.", ephemeral=True); return
-        if not inter.user.guild_permissions.administrator and inter.user.id != inter.guild.owner_id and inter.user.id != DONO_BOT_ID:
+        if not (interaction := inter).user.guild_permissions.administrator and interaction.user.id != interaction.guild.owner_id and interaction.user.id != DONO_BOT_ID:
             await inter.response.send_message("❌ Sem permissão.", ephemeral=True); return
         await inter.response.defer(ephemeral=True)
         try:
@@ -269,7 +301,6 @@ class BotCommands(commands.Cog):
                 await inter.response.send_message("❌ **Número inválido!** Escolha um slot a partir do número 1.", ephemeral=True)
                 return
 
-        guild_id = str(inter.guild.id) if inter.guild else "DirectMessage"
         if texto:
             if len(texto) > 5000:
                 await inter.response.send_message("❌ **Limite de caracteres excedido!** O texto enviado possui mais do que os 5000 caracteres máximos permitidos.", ephemeral=True)
@@ -282,4 +313,47 @@ class BotCommands(commands.Cog):
         texto_salvo = db_get(f"notes/{user_id}/{slot}", "Seu bloco de notas está vazio! Clique em Editar para escrever alguma coisa.")
         embed = discord.Embed(title=f"📝 Bloco de Notas Pessoal (Slot {slot})", description=texto_salvo, color=discord.Color.blue())
         view = NotaView(self.bot, user_id, slot, texto_salvo)
+        await inter.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+    @commands.command(name="dado")
+    async def dado_prefix(self, ctx: commands.Context, lados: int = 6):
+        if lados < 2:
+            await ctx.send("❌ Um dado precisa ter pelo menos 2 lados!")
+            return
+        if lados > 25:
+            res = random.randint(1, lados)
+            await ctx.send(f"🎲 | {ctx.author.mention} rolou um dado de **{lados}** lados e tirou... **{res}**!")
+            return
+            
+        embed = discord.Embed(
+            title=f"🎲 Sorteador Secreto ({lados} lados)",
+            description="Escolha de forma privada qual número você deseja tirar publicamente no chat:",
+            color=discord.Color.blue()
+        )
+        view = DadoPickerView(self.bot, ctx.author.id, ctx.channel.id, lados)
+        try:
+            dm = await ctx.author.create_dm()
+            await dm.send(embed=embed, view=view)
+            await ctx.message.delete()
+        except Exception as e:
+            await ctx.send(f"❌ Não consegui enviar DM. Verifique se suas DMs estão abertas! Erro: {e}")
+
+    @app_commands.command(name="dado", description="Rola um dado de lados variados de forma interativa.")
+    @app_commands.describe(lados="O número de lados do dado (mínimo 2, máximo 25 para escolha interativa).")
+    async def dado_slash(self, inter: discord.Interaction, lados: int = 6):
+        if lados < 2:
+            await inter.response.send_message("❌ Um dado precisa de pelo menos 2 lados!", ephemeral=True)
+            return
+        if lados > 25:
+            res = random.randint(1, lados)
+            await inter.response.send_message(f"🎲 | {inter.user.mention} rolou um dado de **{lados}** lados e tirou: **{res}**!")
+            return
+            
+        embed = discord.Embed(
+            title=f"🎲 Escolha seu Resultado Secreto (Dado de {lados} lados)",
+            description="Clique no botão correspondente ao número que você deseja exibir publicamente no chat:",
+            color=discord.Color.blue()
+        )
+        view = DadoPickerView(self.bot, inter.user.id, inter.channel.id, lados)
         await inter.response.send_message(embed=embed, view=view, ephemeral=True)

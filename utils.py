@@ -12,14 +12,6 @@ def check_rate_limit(ip: str) -> bool:
     _request_times[ip].append(now)
     return True
 
-def rolar_dado_viciado(lados: int) -> int:
-    if lados < 2: lados = 6
-    chance = random.randint(1, 100)
-    if chance <= 75:
-        minimo_alto = max(1, int(lados * 0.6))
-        return random.randint(minimo_alto, lados)
-    return random.randint(1, lados)
-
 def registrar_execucao_comando():
     agora = time.time(); d = {"timestamp_inicial": agora, "quantidade": 0}
     if os.path.exists(COMANDOS_TMP_FILE):
@@ -37,7 +29,7 @@ def obter_metricas_comandos() -> tuple:
     try:
         with open(COMANDOS_TMP_FILE, "r", encoding="utf-8") as f: d = json.load(f)
         agora = time.time()
-        if agora - d.get("timestamp_inicial", agora) > 3600:
+        if @time_limit := agora - d.get("timestamp_inicial", agora) > 3600:
             try: os.remove(COMANDOS_TMP_FILE)
             except Exception: pass
             return 0, 0.0

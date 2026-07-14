@@ -7,7 +7,6 @@ import os
 from database import TOKEN, logger, sincronizar_banco_local
 from utils import registrar_execucao_comando, db_get
 from commands_bot import BotCommands
-from web import rodar_servidor_web
 
 intents = discord.Intents.default()
 intents.message_content = True 
@@ -21,9 +20,6 @@ class MyBot(commands.Bot):
         await self.add_cog(BotCommands(self))
 
 bot = MyBot()
-
-
-# --- INTERCEPTORES DE EVENTO ---
 
 @bot.before_invoke
 async def monitorar_comandos_prefixo(ctx: commands.Context):
@@ -44,9 +40,6 @@ async def on_interaction(interaction: discord.Interaction):
                 else:
                     try: await member.add_roles(role); await interaction.response.send_message(f"✅ Cargo **{role.name}** adicionado!", ephemeral=True)
                     except discord.Forbidden: await interaction.response.send_message("❌ Falha de hierarquia. Coloque meu cargo acima dele!", ephemeral=True)
-
-
-# --- EVENTO DE SEGURANÇA ATIVA: ON_MEMBER_UPDATE ---
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
@@ -92,18 +85,13 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             embed.add_field(name="Responsável Punido", value=f"{promotor.mention if promotor else 'Desconhecido'} (Cargos Removidos)", inline=True)
             await canal.send(embed=embed)
 
-
-# --- EVENTO ON_READY ---
-
 @bot.event
 async def on_ready():
     logger.info(f"Bot do Discord conectado com sucesso como {bot.user}")
     
-    # Injeta a referência ativa do bot no web.py de forma dinâmica
     import web
     web.bot_ref = bot
     
-    # Sincroniza o banco de dados do GitHub Gist com o cache local
     sincronizar_banco_local()
     
     try:
@@ -112,15 +100,15 @@ async def on_ready():
     except Exception as e:
         logger.error(f"Erro ao sincronizar comandos de barra: {e}")
 
-
-# --- INICIALIZAÇÃO MULTI-THREADING ---
+def rodar_servidor_web():
+    app.secret_key = "scn_bot_reimagined_master_key_123"
+    porta = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=porta, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
-    # Dispara o Flask importado do web.py em segundo plano (O Render fará o bind instantâneo)
     thread_web = threading.Thread(target=rodar_servidor_web, daemon=True)
     thread_web.start()
     
-    # Validação de segurança do Token do Discord
     if not TOKEN:
         logger.critical("DISCORD_TOKEN ausente nas variáveis de ambiente.")
     else:
