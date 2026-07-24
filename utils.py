@@ -1,9 +1,11 @@
-import os, json, time, requests, discord, random
-from database import db_get, db_set, logger
+import os, json, time, discord, aiohttp
+from database import db_get, db_set, logger, GEMINI_KEY
 
 COMANDOS_TMP_FILE = "comandos_hora.tmp"
 from collections import defaultdict
 _request_times = defaultdict(list)
+
+MODELOS_GEMINI = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash", "gemini-3.1-flash-lite", "gemini-3.1-pro", "gemini-3-pro", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2-flash", "gemini-2-pro", "gemini-1.5-pro", "gemini-1.5-flash"]
 
 def check_rate_limit(ip: str) -> bool:
     now = time.time()
@@ -11,49 +13,6 @@ def check_rate_limit(ip: str) -> bool:
     if len(_request_times[ip]) >= 30: return False
     _request_times[ip].append(now)
     return True
-
-def rolar_dado_viciado(lados: int) -> int:
-    if lados < 2: lados = 6
-    chance = random.randint(1, 100)
-    if chance <= 75:
-        minimo_alto = max(1, int(lados * 0.6))
-        return random.randint(minimo_alto, lados)
-    return random.randint(1, lados)
-
-def gerar_imagem_perfil(nome: str, bot_id: int, avatar_url: str, pos: str, descricao: str, fundo_cor: str, fundo_url=None, tema=None) -> io.BytesIO:
-    tema = tema or TEMAS_DISPONIVEIS["dark"]
-    W, H = 600, 300
-    if fundo_url:
-        try: resp = requests.get(fundo_url, timeout=3); img_fundo = Image.open(io.BytesIO(resp.content)).convert("RGBA").resize((W, H))
-        except Exception: img_fundo = Image.new("RGBA", (W, H), fundo_cor)
-    else:
-        try: img_fundo = Image.new("RGBA", (W, H), fundo_cor)
-        except Exception: img_fundo = Image.new("RGBA", (W, H), "#2f3136")
-    draw = ImageDraw.Draw(img_fundo)
-    draw.rectangle([20, 200, 580, 280], fill=tema.get("caixa_bio", (0,0,0,110)))
-    sz = 120
-    try:
-        resp_av = requests.get(avatar_url, timeout=3); av = Image.open(io.BytesIO(resp_av.content)).convert("RGBA").resize((sz, sz))
-        mask = Image.new("L", (sz, sz), 0); ImageDraw.Draw(mask).ellipse((0, 0, sz, sz), fill=255)
-        p = 20
-        posicoes = {"superior_esquerdo": (p, p), "se": (p, p), "superior_direito": (W-sz-p, p), "sd": (W-sz-p, p), "inferior_esquerdo": (p, H-sz-p), "ie": (p, H-sz-p), "inferior_direito": (W-sz-p, H-sz-p), "id": (W-sz-p, H-sz-p)}
-        img_fundo.paste(av, posicoes.get(pos, (p, p)), mask)
-    except Exception as e: print(f"Erro avatar: {e}")
-    f_n = f_d = None
-    try:
-        paths = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "arial.ttf", "C:\\Windows\\Fonts\\arial.ttf"]
-        for path in paths:
-            if os.path.exists(path): f_n = ImageFont.truetype(path, 18); f_d = ImageFont.truetype(path, 14); break
-    except Exception: pass
-    f_n = f_n or ImageFont.load_default(); f_d = f_d or ImageFont.load_default()
-    x = 160 if pos in ["se", "ie", "superior_esquerdo", "inferior_esquerdo"] else 40
-    y = 40 if pos in ["se", "sd", "superior_esquerdo", "superior_direito"] else 120
-    draw.text((x, y), nome, fill=tema.get("texto_principal", "#fff"), font=f_n)
-    draw.text((x, y + 30), f"ID: #{bot_id}", fill="#5865F2", font=f_n)
-    lines = [descricao[i:i+55] for i in range(0, len(descricao), 55)]
-    curr_y = 210
-    for l in lines[:3]: draw.text((30, curr_y), l, fill=tema.get("texto_secundario", "#b0b0b0"), font=f_d); curr_y += 22
-    buf = io.BytesIO(); img_fundo.convert("RGB").save(buf, format="PNG"); buf.seek(0); return buf
 
 def registrar_execucao_comando():
     agora = time.time(); d = {"timestamp_inicial": agora, "quantidade": 0}
@@ -105,3 +64,41 @@ def extrair_estrutura_completa_servidor(guild) -> dict:
         t = "text" if isinstance(ch, discord.TextChannel) else "voice" if isinstance(ch, discord.VoiceChannel) else None
         if t: chans.append({"id": ch.id, "type": t, "name": ch.name, "category_id": ch.category.id if ch.category else None, "position": ch.position, "topic": getattr(ch, "topic", None), "overwrites": serializar_permissoes_canal(ch)})
     return {"guild_name": guild.name, "roles": roles, "categories": cats, "channels": chans}
+
+def analisar_texto(texto: str) -> dict:
+    return {"totais": len(texto), "sem_espaco": len("".join(texto.split())), "linhas": len(texto.splitlines()), "palavras": len(texto.split()), "espacos": texto.count(" ")}
+
+def corrigir_texto_sem_ia(texto: str) -> str:
+    correcoes = {"apos": "após", "nao": "não", "vc": "você", "tmb": "também", "pq": "porque", "oque": "o que", "concerteza": "com certeza", "excessao": "exceção", "derrepente": "de repente"}
+    sinonimos = {"fazer": "realizar", "bom": "excelente", "grande": "imenso", "feliz": "alegre", "triste": "chateado", "falar": "dizer", "coisa": "elemento", "muito": "bastante"}
+    palavras = texto.split(" ")
+    resultado = []; recentes = []
+    for p in palavras:
+        prefixo = ""; sufixo = ""
+        while p and p[0] in "*\"'>.,!?": prefixo += p[0]; p = p[1:]
+        while p and p[-1] in "*\"'>.,!?": sufixo = p[-1] + sufixo; p = p[:-1]
+        clean_p = p.lower()
+        if clean_p in correcoes:
+            p = correcoes[clean_p]
+            clean_p = p.lower()
+        if clean_p in recentes and clean_p in sinonimos:
+            p = sinonimos[clean_p]
+        resultado.append(f"{prefixo}{p}{sufixo}")
+        recentes.append(clean_p)
+        if len(recentes) > 10: recentes.pop(0)
+    return " ".join(resultado)
+
+async def chamar_gemini(system_prompt: str, user_prompt: str, start_idx: int = 0):
+    if not GEMINI_KEY: return "❌ Chave da API (Key) não configurada no ambiente.", start_idx
+    async with aiohttp.ClientSession() as session:
+        for i in range(start_idx, len(MODELOS_GEMINI)):
+            modelo = MODELOS_GEMINI[i]
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={GEMINI_KEY}"
+            payload = {"system_instruction": {"parts": [{"text": system_prompt}]}, "contents": [{"parts": [{"text": user_prompt}]}], "generationConfig": {"temperature": 0.7}}
+            try:
+                async with session.post(url, json=payload, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data["candidates"][0]["content"]["parts"][0]["text"], i
+            except Exception: continue
+    return "❌ Todos os modelos de IA falharam. Tente novamente mais tarde.", len(MODELOS_GEMINI)

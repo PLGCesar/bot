@@ -1,10 +1,13 @@
-import os, json, requests, logging
+import os, json, requests
+import logging
+
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get('DISCORD_TOKEN')
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
 GIST_ID = os.environ.get('GIST_ID')
+GEMINI_KEY = os.environ.get('Key')
 DONO_BOT_ID = 1520539744457461892
 SENHA_ADMIN_FILE = "senha_admin.txt"
 
@@ -20,11 +23,8 @@ def sincronizar_banco_local():
                 _local_cache = json.loads(resp.json().get("files", {}).get("database.json", {}).get("content", "{}"))
                 with open("local_db.json", "w", encoding="utf-8") as f:
                     json.dump(_local_cache, f, indent=4, ensure_ascii=False)
-                logger.info("Gist DB sincronizado!")
                 return
-            else:
-                logger.warning(f"Status {resp.status_code} ao carregar Gist no boot.")
-        except Exception as e: logger.error(f"Erro Gist: {e}")
+        except Exception: pass
     if os.path.exists("local_db.json"):
         try:
             with open("local_db.json", "r", encoding="utf-8") as f: _local_cache = json.load(f)
@@ -47,14 +47,12 @@ def db_set(path: str, value) -> bool:
     temp[keys[-1]] = value
     try:
         with open("local_db.json", "w", encoding="utf-8") as f: json.dump(_local_cache, f, indent=4, ensure_ascii=False)
-    except Exception as e: logger.error(f"Erro local_db: {e}"); return False
+    except Exception: return False
     if GITHUB_TOKEN and GIST_ID:
         headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
         payload = {"files": {"database.json": {"content": json.dumps(_local_cache, indent=4, ensure_ascii=False)}}}
-        try:
-            resp = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload, timeout=5)
-            return resp.status_code == 200
-        except Exception as e: logger.error(f"Erro PATCH Gist: {e}"); return True
+        try: requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload, timeout=5)
+        except Exception: pass
     return True
 
 def obter_senha_admin(): return db_get("admin_config/password", "")
